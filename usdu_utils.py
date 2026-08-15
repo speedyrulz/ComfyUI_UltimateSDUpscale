@@ -490,33 +490,35 @@ def crop_mask(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pa
     cond_dict["mask"] = torch.cat(masks, dim=0)  # (B, H, W)
 
 # Added Flux-Kontext Support crop_reference_latents by TBG ETUR
-def crop_reference_latents(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pad):
+def crop_reference_latents(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pad, latent_scale=8):
     """
     1. Resize each latent to `canvas_size` in latent units.
-    2. Crop the rectangle `region` (pixel coordinates).
-    3. Down-sample the crop to latent-space `tile_size`.
+    2. Crop the rectangle of each region (pixel coordinates).
+    3. Down-sample each crop to latent-space `tile_size`.
     Expects a list of BCHW tensors under "reference_latents".
 
-    Does not support multiple regions.
+    Supports multiple regions: the crops are concatenated along the batch dimension
+    so that each tile in a batched sampling pass gets its own reference region.
+
+    :param latent_scale: The pixel -> latent downscale factor of the VAE in use
+        (8 for SD/SDXL/Flux.1, 16 for Flux.2 and other high compression VAEs).
     """
 
     latents = cond_dict.get("reference_latents")
     if not isinstance(latents, list):
         return  # nothing to do
 
-    # Only use first region if multiple regions are given
-    region = regions if isinstance(regions, tuple) else regions[0]
+    if not isinstance(regions, list):
+        regions = [regions]
 
-    k = 8  # down-sample factor from pixel space → latent space (SD-type models)
+    k = max(1, int(latent_scale))  # down-sample factor from pixel space → latent space
 
     W_can_px, H_can_px = canvas_size
     # canvas size expressed in latent units
-    W_can_lat, H_can_lat = W_can_px // k, H_can_px // k
+    W_can_lat, H_can_lat = max(1, W_can_px // k), max(1, H_can_px // k)
 
     W_tile_px, H_tile_px = tile_size
     W_tile_lat, H_tile_lat = max(1, W_tile_px // k), max(1, H_tile_px // k)
-
-    x1_px, y1_px, x2_px, y2_px = region
 
     new_latents = []
     for t in latents:  # (B,C,H_lat_in,W_lat_in)
@@ -534,19 +536,26 @@ def crop_reference_latents(cond_dict, regions, init_size, canvas_size, tile_size
                               mode="bilinear",
                               align_corners=False)
 
-        # 2. Convert pixel crop → latent slice
-        w0_lat = int(round(x1_px / k))
-        w1_lat = int(round(x2_px / k))
-        h0_lat = int(round(y1_px / k))
-        h1_lat = int(round(y2_px / k))
+        crops = []
+        for region in regions:
+            x1_px, y1_px, x2_px, y2_px = region
 
-        cropped = t[:, :, h0_lat:h1_lat, w0_lat:w1_lat]  # view
+            # 2. Convert pixel crop → latent slice
+            w0_lat = int(round(x1_px / k))
+            w1_lat = max(w0_lat + 1, int(round(x2_px / k)))
+            h0_lat = int(round(y1_px / k))
+            h1_lat = max(h0_lat + 1, int(round(y2_px / k)))
 
-        # 3. Down-sample to latent-tile size
-        cropped = F.interpolate(cropped,
-                                size=(H_tile_lat, W_tile_lat),
-                                mode="bilinear",
-                                align_corners=False)
+            cropped = t[:, :, h0_lat:h1_lat, w0_lat:w1_lat]  # view
+
+            # 3. Down-sample to latent-tile size
+            cropped = F.interpolate(cropped,
+                                    size=(H_tile_lat, W_tile_lat),
+                                    mode="bilinear",
+                                    align_corners=False)
+            crops.append(cropped)
+
+        cropped = torch.cat(crops, dim=0) if len(crops) > 1 else crops[0]
         if has_5d:
             cropped = cropped.unsqueeze(2)
         new_latents.append(cropped)
@@ -554,8 +563,21 @@ def crop_reference_latents(cond_dict, regions, init_size, canvas_size, tile_size
     cond_dict["reference_latents"] = new_latents
 
 
+def set_reference_latents(cond, reference_latent):
+    """
+    Return a copy of *cond* where every entry uses *reference_latent* as its only
+    reference latent. Used for the per-tile reference latents so that each tile is
+    conditioned on the matching region of the reference image instead of the whole image.
+    """
+    out = []
+    for emb, cond_dict in cond:
+        cond_dict = cond_dict.copy()
+        cond_dict["reference_latents"] = [reference_latent]
+        out.append([emb, cond_dict])
+    return out
 
-def crop_cond(cond, regions, init_size, canvas_size, tile_size, w_pad=0, h_pad=0):
+
+def crop_cond(cond, regions, init_size, canvas_size, tile_size, w_pad=0, h_pad=0, latent_scale=8):
     cropped = []
     for emb, x in cond:
         cond_dict = x.copy()
@@ -564,6 +586,6 @@ def crop_cond(cond, regions, init_size, canvas_size, tile_size, w_pad=0, h_pad=0
         crop_gligen(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pad)
         crop_area(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pad)
         crop_mask(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pad)
-        crop_reference_latents(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pad)
+        crop_reference_latents(cond_dict, regions, init_size, canvas_size, tile_size, w_pad, h_pad, latent_scale)
         cropped.append(n)
     return cropped

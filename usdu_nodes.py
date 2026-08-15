@@ -74,9 +74,18 @@ def USDU_base_inputs():
         ("batch_size", ("INT", {"default": 1, "min": 1, "max": 4096, "step": 1, "tooltip": "The number of tiles to process in a batch. Higher values can reduce processing time but use more VRAM. Yields different results than individual tiles. Only affects the main redraw step, not the seam fix step."})),
     ]
 
-    optional = []
+    optional = list(USDU_reference_inputs())
 
     return required, optional
+
+
+def USDU_reference_inputs():
+    """Inputs for per-tile reference latents (Flux.2 Klein, Kontext, Qwen Edit, ...)."""
+    return [
+        ("tile_reference_latent", ("BOOLEAN", {"default": False, "tooltip": "Use the region of the image that matches the tile being generated as the reference latent for that tile. Required for reference latent models such as Flux.2 Klein: feeding a reference latent through the conditioning instead uses the whole image as the reference for every tile. Replaces any reference latents already present on the positive conditioning."})),
+        ("reference_strength", ("FLOAT", {"default": 1.00, "min": 0.0, "max": 3.0, "step": 0.01, "tooltip": "How strongly the reference latent influences each tile. The models have no native strength for reference latents, so the latent itself is scaled: 1.00 uses it as is, lower values weaken it towards a blank reference, and values above 1.00 exaggerate it and can push the model out of distribution. Also applies to reference latents supplied through the conditioning."})),
+        ("reference_image", ("IMAGE", {"tooltip": "Optional image to take the reference tiles from when tile_reference_latent is enabled. Defaults to the image being upscaled. Any resolution: the region matching the current tile is cropped and resized to the tile size before encoding."})),
+    ]
 
 
 def prepare_inputs(required: list, optional: list = None):
@@ -124,7 +133,8 @@ class UltimateSDUpscale:
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                 seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
-                custom_sampler=None, custom_sigmas=None):
+                custom_sampler=None, custom_sigmas=None,
+                tile_reference_latent=False, reference_strength=1.0, reference_image=None):
         redraw_mode = MODES[mode_type]
         seam_fix_mode = SEAM_FIX_MODES[seam_fix_mode]
 
@@ -151,6 +161,8 @@ class UltimateSDUpscale:
             seed, steps, cfg, sampler_name, scheduler, denoise, upscale_by, force_uniform_tiles, tiled_decode,
             tile_width, tile_height, redraw_mode, seam_fix_mode,
             custom_sampler, custom_sigmas, batch_size,
+            tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
+            reference_image=reference_image,
         )
         logger.debug("StableDiffusionProcessing created with batch_size=%s", sdprocessing.batch_size)
 
@@ -192,7 +204,8 @@ class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
                 steps, cfg, sampler_name, scheduler, denoise,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1):
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
+                tile_reference_latent=False, reference_strength=1.0, reference_image=None):
         upscale_by = 1.0
 
         logger.debug("UltimateSDUpscaleNoUpscale.upscale() received batch_size=%s", batch_size)
@@ -201,7 +214,9 @@ class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
                                steps, cfg, sampler_name, scheduler, denoise, None,
                                mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size)
+                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size,
+                               tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
+                               reference_image=reference_image)
     
 class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
     @classmethod
@@ -225,13 +240,16 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                 seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
                 upscale_model=None,
-                custom_sampler=None, custom_sigmas=None):
+                custom_sampler=None, custom_sigmas=None,
+                tile_reference_latent=False, reference_strength=1.0, reference_image=None):
         return super().upscale(image, model, positive, negative, vae, upscale_by, seed,
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                 seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size,
-                custom_sampler, custom_sigmas)
+                custom_sampler, custom_sigmas,
+                tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
+                reference_image=reference_image)
 
 def USDU_guider_inputs():
     required = [
@@ -262,7 +280,7 @@ def USDU_guider_inputs():
         ("batch_size", ("INT", {"default": 1, "min": 1, "max": 4096, "step": 1, "tooltip": "The number of tiles to process in a batch. Higher values can reduce processing time but use more VRAM. Yields different results than individual tiles. Only affects the main redraw step, not the seam fix step."})),
     ]
 
-    optional = []
+    optional = list(USDU_reference_inputs())
 
     return required, optional
 
@@ -282,7 +300,8 @@ class UltimateSDUpscaleGuider:
     def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1):
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
+                tile_reference_latent=False, reference_strength=1.0, reference_image=None):
         redraw_mode = MODES[mode_type]
         seam_fix_mode = SEAM_FIX_MODES[seam_fix_mode]
 
@@ -304,6 +323,8 @@ class UltimateSDUpscaleGuider:
             tile_width, tile_height, redraw_mode, seam_fix_mode,
             custom_sampler=sampler, custom_sigmas=sigmas, batch_size=batch_size,
             guider=guider,
+            tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
+            reference_image=reference_image,
         )
         logger.debug("StableDiffusionProcessing created with guider, batch_size=%s", sdprocessing.batch_size)
 

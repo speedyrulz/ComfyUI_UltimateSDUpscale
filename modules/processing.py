@@ -7,7 +7,11 @@ from comfy_extras.nodes_custom_sampler import SamplerCustom
 import comfy.sample
 import comfy.model_management
 import latent_preview
-from usdu_utils import pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
+from usdu_utils import (
+    pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond,
+    crop_reference_latents, resize_region, resize_tensor, set_reference_latents,
+)
+from contextlib import contextmanager
 from modules import shared
 from tqdm import tqdm
 import comfy.utils as comfy_utils
@@ -60,6 +64,9 @@ class StableDiffusionProcessing:
         custom_sigmas=None,
         batch_size=1,
         guider=None,
+        tile_reference_latent=False,
+        reference_image=None,
+        reference_strength=1.0,
     ):
         # Variables used by the USDU script
         self.init_images = [init_img]
@@ -85,6 +92,11 @@ class StableDiffusionProcessing:
         self.sampler_name = sampler_name
         self.scheduler = scheduler
         self.denoise = denoise
+
+        # Per-tile reference latents (Flux.2 Klein, Kontext, Qwen Edit, ...)
+        self.tile_reference_latent = tile_reference_latent
+        self.reference_image = reference_image
+        self.reference_strength = reference_strength
 
         # Optional custom sampler and sigmas
         self.custom_sampler = custom_sampler
@@ -199,6 +211,132 @@ def sample_with_guider(guider, sampler, sigmas, seed, latent):
     return {"samples": samples}
 
 
+def get_latent_scale(p: StableDiffusionProcessing) -> int:
+    """The pixel -> latent downscale factor of the VAE (8 for SD/Flux.1, 16 for Flux.2)."""
+    try:
+        return int(p.vae.spacial_compression_encode())
+    except Exception:
+        logger.debug("Could not query the VAE compression ratio, assuming 8")
+        return 8
+
+
+def scale_reference_latent(p: StableDiffusionProcessing, latent):
+    """
+    Scale a reference latent by p.reference_strength.
+
+    The models have no native strength for reference latents, so the latent itself is
+    scaled towards the neutral point of the model's latent format: 1.0 leaves it untouched,
+    0.0 makes it a blank reference and values above 1.0 exaggerate it.
+    """
+    strength = p.reference_strength
+    if latent is None or strength == 1.0:
+        return latent
+
+    shift = 0.0
+    latent_format = getattr(getattr(p.model, "model", None), "latent_format", None)
+    if latent_format is not None:
+        shift = getattr(latent_format, "shift_factor", 0.0)
+        if shift is None:
+            shift = 0.0
+    if torch.is_tensor(shift):
+        # Per channel shift, broadcast over the channel dimension of a (B, C, ...) latent
+        shift = shift.to(device=latent.device, dtype=latent.dtype)
+        shift = shift.view(1, -1, *([1] * (latent.ndim - 2)))
+
+    return shift + (latent - shift) * strength
+
+
+def scale_cond_reference_latents(p: StableDiffusionProcessing, cond):
+    """Apply the reference strength to the reference latents of an already cropped conditioning."""
+    if p.reference_strength == 1.0:
+        return cond
+    out = []
+    for emb, cond_dict in cond:
+        latents = cond_dict.get("reference_latents")
+        if isinstance(latents, list):
+            cond_dict = cond_dict.copy()
+            cond_dict["reference_latents"] = [scale_reference_latent(p, lat) for lat in latents]
+        out.append([emb, cond_dict])
+    return out
+
+
+def encode_reference_tiles(p: StableDiffusionProcessing, crop_regions, canvas_size, tile_size, image_index=0):
+    """Crop the given regions out of the reference image and VAE encode them as a latent batch."""
+    ref = p.reference_image
+    if ref.shape[0] > 1:
+        ref = ref[min(image_index, ref.shape[0] - 1):][:1]
+    else:
+        ref = ref[:1]
+    ref_size = (ref.shape[2], ref.shape[1])  # (w, h)
+
+    crops = []
+    for region in crop_regions:
+        x1, y1, x2, y2 = resize_region(region, canvas_size, ref_size)
+        crop = ref[:, y1:y2, x1:x2, :]
+        if (crop.shape[2], crop.shape[1]) != tuple(tile_size):
+            crop = resize_tensor(crop.movedim(-1, 1), (tile_size[1], tile_size[0]), mode="bilinear").movedim(1, -1)
+        crops.append(crop)
+
+    (latent,) = p.vae_encoder.encode(p.vae, torch.cat(crops, dim=0))
+    return latent["samples"]
+
+
+def get_tile_reference_latent(p: StableDiffusionProcessing, crop_regions, canvas_size, tile_size,
+                              tile_latent, image_index=0):
+    """
+    Build the reference latent for the tile(s) currently being generated.
+
+    Returns None when the per-tile reference is disabled, in which case any reference
+    latents already present on the conditioning are cropped to the tile instead.
+    """
+    if not p.tile_reference_latent:
+        return None
+    if not isinstance(crop_regions, list):
+        crop_regions = [crop_regions]
+    if p.reference_image is None:
+        # The tile of the image being upscaled has already been encoded for img2img,
+        # reuse it instead of encoding the same pixels twice.
+        latent = tile_latent["samples"]
+    else:
+        latent = encode_reference_tiles(p, crop_regions, canvas_size, tile_size, image_index)
+    return scale_reference_latent(p, latent)
+
+
+@contextmanager
+def guider_reference_latents(p: StableDiffusionProcessing, guider, reference_latent, crop_regions,
+                             canvas_size, tile_size):
+    """
+    Temporarily replace the reference latents held by a guider's conditioning with the
+    per-tile reference latent (or with the tile-cropped version of the latents it already has).
+    """
+    conds = getattr(guider, "original_conds", None)
+    if conds is None:
+        yield
+        return
+
+    latent_scale = get_latent_scale(p)
+    originals = dict(conds)
+    try:
+        for key, cond_list in originals.items():
+            patched = []
+            for cond_dict in cond_list:
+                cond_dict = cond_dict.copy()
+                if reference_latent is not None and key == "positive":
+                    cond_dict["reference_latents"] = [reference_latent]
+                else:
+                    crop_reference_latents(cond_dict, crop_regions, p.init_size, canvas_size,
+                                           tile_size, 0, 0, latent_scale)
+                    latents = cond_dict.get("reference_latents")
+                    if isinstance(latents, list):
+                        cond_dict["reference_latents"] = [scale_reference_latent(p, lat) for lat in latents]
+                patched.append(cond_dict)
+            conds[key] = patched
+        yield
+    finally:
+        for key, cond_list in originals.items():
+            conds[key] = cond_list
+
+
 def process_images(p: StableDiffusionProcessing) -> Processed:
     # Where the main image generation happens in A1111
 
@@ -257,14 +395,27 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     batched_tiles = torch.cat([pil_to_tensor(tile) for tile in tiles], dim=0)
     (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
 
+    # Reference latent for the tile currently being generated
+    reference_latent = get_tile_reference_latent(p, crop_region, init_image.size, tile_size, latent)
+
     if p.guider is not None:
         # Guider-based sampling
-        with crop_model_cond(p.model, crop_region, p.init_size, init_image.size, tile_size) as model:
+        with guider_reference_latents(p, p.guider, reference_latent, crop_region, init_image.size, tile_size), \
+                crop_model_cond(p.model, crop_region, p.init_size, init_image.size, tile_size) as model:
             samples = sample_with_guider(p.guider, p.custom_sampler, p.custom_sigmas, p.seed, latent)
     else:
         # Crop conditioning
-        positive_cropped = crop_cond(p.positive, crop_region, p.init_size, init_image.size, tile_size)
-        negative_cropped = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size)
+        latent_scale = get_latent_scale(p)
+        positive_cropped = crop_cond(p.positive, crop_region, p.init_size, init_image.size, tile_size,
+                                     latent_scale=latent_scale)
+        negative_cropped = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size,
+                                     latent_scale=latent_scale)
+
+        positive_cropped = scale_cond_reference_latents(p, positive_cropped)
+        negative_cropped = scale_cond_reference_latents(p, negative_cropped)
+
+        if reference_latent is not None:
+            positive_cropped = set_reference_latents(positive_cropped, reference_latent)
 
         with crop_model_cond(p.model, crop_region, p.init_size, init_image.size, tile_size) as model:
             # Generate samples
@@ -387,14 +538,27 @@ def process_batch_tiles(
 
     first_tile_size = batch_tile_sizes[0]
 
+    # Reference latents for every tile in the batch, in the same order as the encoded tiles
+    reference_latent = get_tile_reference_latent(p, batch_crop_regions, images[0].size, first_tile_size, latent)
+
     if p.guider is not None:
         # Guider-based sampling
-        with crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
+        with guider_reference_latents(p, p.guider, reference_latent, batch_crop_regions, images[0].size, first_tile_size), \
+                crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
             samples = sample_with_guider(p.guider, p.custom_sampler, p.custom_sigmas, p.seed, latent)
     else:
         # Crop conditioning using the full list of regions (first tile size assumed uniform)
-        positive_cropped = crop_cond(p.positive, batch_crop_regions, p.init_size, images[0].size, first_tile_size)
-        negative_cropped = crop_cond(p.negative, batch_crop_regions, p.init_size, images[0].size, first_tile_size)
+        latent_scale = get_latent_scale(p)
+        positive_cropped = crop_cond(p.positive, batch_crop_regions, p.init_size, images[0].size, first_tile_size,
+                                     latent_scale=latent_scale)
+        negative_cropped = crop_cond(p.negative, batch_crop_regions, p.init_size, images[0].size, first_tile_size,
+                                     latent_scale=latent_scale)
+
+        positive_cropped = scale_cond_reference_latents(p, positive_cropped)
+        negative_cropped = scale_cond_reference_latents(p, negative_cropped)
+
+        if reference_latent is not None:
+            positive_cropped = set_reference_latents(positive_cropped, reference_latent)
 
         with crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
             samples = sample(model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler,
