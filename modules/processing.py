@@ -220,44 +220,58 @@ def get_latent_scale(p: StableDiffusionProcessing) -> int:
         return 8
 
 
-def scale_reference_latent(p: StableDiffusionProcessing, latent):
+def reference_strength_patch(strength: float):
     """
-    Scale a reference latent by p.reference_strength.
+    Attention patch that scales the keys and values of the reference image tokens.
 
-    The models have no native strength for reference latents, so the latent itself is
-    scaled towards the neutral point of the model's latent format: 1.0 leaves it untouched,
-    0.0 makes it a blank reference and values above 1.0 exaggerate it.
+    The reference latents are appended to the token sequence, so scaling their keys and
+    values in every attention block is what actually weakens or strengthens the reference,
+    the way the FLUX.2 Klein reference latent controller nodes do it. The reference tokens
+    are always the last tokens of the sequence.
     """
-    strength = p.reference_strength
-    if latent is None or strength == 1.0:
-        return latent
+    def patch(q, k, v, extra_options={}, **kwargs):
+        ref_tokens = extra_options.get("reference_image_num_tokens", [])
+        if not ref_tokens:
+            return {}
+        total_ref = sum(ref_tokens)
+        if total_ref <= 0 or total_ref >= k.shape[2]:
+            return {}
 
-    shift = 0.0
-    latent_format = getattr(getattr(p.model, "model", None), "latent_format", None)
-    if latent_format is not None:
-        shift = getattr(latent_format, "shift_factor", 0.0)
-        if shift is None:
-            shift = 0.0
-    if torch.is_tensor(shift):
-        # Per channel shift, broadcast over the channel dimension of a (B, C, ...) latent
-        shift = shift.to(device=latent.device, dtype=latent.dtype)
-        shift = shift.view(1, -1, *([1] * (latent.ndim - 2)))
+        k = k.clone()
+        v = v.clone()
+        k[:, :, -total_ref:, :] *= strength
+        v[:, :, -total_ref:, :] *= strength
+        return {"q": q, "k": k, "v": v}
 
-    return shift + (latent - shift) * strength
+    return patch
 
 
-def scale_cond_reference_latents(p: StableDiffusionProcessing, cond):
-    """Apply the reference strength to the reference latents of an already cropped conditioning."""
-    if p.reference_strength == 1.0:
-        return cond
-    out = []
-    for emb, cond_dict in cond:
-        latents = cond_dict.get("reference_latents")
-        if isinstance(latents, list):
-            cond_dict = cond_dict.copy()
-            cond_dict["reference_latents"] = [scale_reference_latent(p, lat) for lat in latents]
-        out.append([emb, cond_dict])
-    return out
+def apply_reference_strength(model, strength: float):
+    """Return a clone of *model* whose reference image tokens are scaled by *strength*."""
+    if strength == 1.0:
+        return model
+    model = model.clone()
+    model.set_model_attn1_patch(reference_strength_patch(strength))
+    return model
+
+
+@contextmanager
+def guider_reference_strength(guider, strength: float):
+    """Apply the reference strength to the model a guider samples with."""
+    if guider is None or strength == 1.0:
+        yield
+        return
+
+    original_patcher = guider.model_patcher
+    original_options = guider.model_options
+    patched = apply_reference_strength(original_patcher, strength)
+    guider.model_patcher = patched
+    guider.model_options = patched.model_options
+    try:
+        yield
+    finally:
+        guider.model_patcher = original_patcher
+        guider.model_options = original_options
 
 
 def encode_reference_tiles(p: StableDiffusionProcessing, crop_regions, canvas_size, tile_size, image_index=0):
@@ -299,7 +313,7 @@ def get_tile_reference_latent(p: StableDiffusionProcessing, crop_regions, canvas
         latent = tile_latent["samples"]
     else:
         latent = encode_reference_tiles(p, crop_regions, canvas_size, tile_size, image_index)
-    return scale_reference_latent(p, latent)
+    return latent
 
 
 @contextmanager
@@ -326,9 +340,6 @@ def guider_reference_latents(p: StableDiffusionProcessing, guider, reference_lat
                 else:
                     crop_reference_latents(cond_dict, crop_regions, p.init_size, canvas_size,
                                            tile_size, 0, 0, latent_scale)
-                    latents = cond_dict.get("reference_latents")
-                    if isinstance(latents, list):
-                        cond_dict["reference_latents"] = [scale_reference_latent(p, lat) for lat in latents]
                 patched.append(cond_dict)
             conds[key] = patched
         yield
@@ -401,6 +412,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     if p.guider is not None:
         # Guider-based sampling
         with guider_reference_latents(p, p.guider, reference_latent, crop_region, init_image.size, tile_size), \
+                guider_reference_strength(p.guider, p.reference_strength), \
                 crop_model_cond(p.model, crop_region, p.init_size, init_image.size, tile_size) as model:
             samples = sample_with_guider(p.guider, p.custom_sampler, p.custom_sigmas, p.seed, latent)
     else:
@@ -411,13 +423,11 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         negative_cropped = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size,
                                      latent_scale=latent_scale)
 
-        positive_cropped = scale_cond_reference_latents(p, positive_cropped)
-        negative_cropped = scale_cond_reference_latents(p, negative_cropped)
-
         if reference_latent is not None:
             positive_cropped = set_reference_latents(positive_cropped, reference_latent)
 
         with crop_model_cond(p.model, crop_region, p.init_size, init_image.size, tile_size) as model:
+            model = apply_reference_strength(model, p.reference_strength)
             # Generate samples
             samples = sample(model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler, positive_cropped,
                             negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
@@ -544,6 +554,7 @@ def process_batch_tiles(
     if p.guider is not None:
         # Guider-based sampling
         with guider_reference_latents(p, p.guider, reference_latent, batch_crop_regions, images[0].size, first_tile_size), \
+                guider_reference_strength(p.guider, p.reference_strength), \
                 crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
             samples = sample_with_guider(p.guider, p.custom_sampler, p.custom_sigmas, p.seed, latent)
     else:
@@ -554,13 +565,11 @@ def process_batch_tiles(
         negative_cropped = crop_cond(p.negative, batch_crop_regions, p.init_size, images[0].size, first_tile_size,
                                      latent_scale=latent_scale)
 
-        positive_cropped = scale_cond_reference_latents(p, positive_cropped)
-        negative_cropped = scale_cond_reference_latents(p, negative_cropped)
-
         if reference_latent is not None:
             positive_cropped = set_reference_latents(positive_cropped, reference_latent)
 
         with crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
+            model = apply_reference_strength(model, p.reference_strength)
             samples = sample(model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler,
                              positive_cropped, negative_cropped, latent, p.denoise,
                              p.custom_sampler, p.custom_sigmas)
