@@ -84,7 +84,10 @@ class StableDiffusionProcessing:
         self.cfg = cfg
         self.sampler_name = sampler_name
         self.scheduler = scheduler
-        self.denoise = denoise
+        # A1111 name used by the USDU script, which reassigns it per pass
+        # (the seam fix passes set it to seam_fix_denoise), so the sampling
+        # path must read this attribute rather than the constructor argument.
+        self.denoising_strength = denoise
 
         # Optional custom sampler and sigmas
         self.custom_sampler = custom_sampler
@@ -269,7 +272,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         with crop_model_cond(p.model, crop_region, p.init_size, init_image.size, tile_size) as model:
             # Generate samples
             samples = sample(model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler, positive_cropped,
-                            negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
+                            negative_cropped, latent, p.denoising_strength, p.custom_sampler, p.custom_sigmas)
 
     # Update the progress bar
     if p.progress_bar_enabled:
@@ -398,7 +401,7 @@ def process_batch_tiles(
 
         with crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
             samples = sample(model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler,
-                             positive_cropped, negative_cropped, latent, p.denoise,
+                             positive_cropped, negative_cropped, latent, p.denoising_strength,
                              p.custom_sampler, p.custom_sigmas)
 
     # Update progress bar once per batch call (one step per tile coord)

@@ -21,18 +21,18 @@ After the redraw step, the seam fix step is applied if enabled. There are variou
 | `vae` | VAE | Model Selection | None | - | The VAE model to use for encoding and decoding tiles. |
 | `upscale_by` | FLOAT | Slider | 2.0 | 0.05-4.0 (step 0.05) | The factor to multiply the height and width of the input image(s) by. |
 | `seed` | INT | Number Input | 0 | 0-18446744073709551615 | The seed to use for image-to-image processing, ensuring reproducible results. |
-| `steps` | INT | Number Input | 20 | 1-10000 | The number of sampling steps to use for each tile during the redraw step and seam fix step. |
+| `steps` | INT | Number Input | 20 | 1-10000 | The number of sampling steps to use for each tile during the redraw step and seam fix step. Ignored when both `custom_sampler` and `custom_sigmas` are provided, since the number of sigmas then determines the step count. |
 | `cfg` | FLOAT | Slider | 8.0 | 0.0-100.0 | The CFG (Classifier Free Guidance) scale to use for each tile. Higher values make the output follow the prompt more closely. The recommended values depend on the model. |
 | `sampler_name` | COMBO | Dropdown | - | Available samplers | The sampler to use for each tile during the image-to-image process. |
-| `scheduler` | COMBO | Dropdown | - | Available schedulers | The scheduler to use for each tile during the sampling process. |
-| `denoise` | FLOAT | Slider | 0.2 | 0.0-1.0 (step 0.01) | The denoising strength to use for each tile. Higher values allow more creative changes, but more chance of seams. |
+| `scheduler` | COMBO | Dropdown | - | Available schedulers | The scheduler to use for each tile during the sampling process. Ignored when both `custom_sampler` and `custom_sigmas` are provided, since `custom_sigmas` supplies the noise schedule instead. |
+| `denoise` | FLOAT | Slider | 0.2 | 0.0-1.0 (step 0.01) | The denoising strength to use for each tile during the redraw step. Higher values allow more creative changes, but more chance of seams. Ignored when both `custom_sampler` and `custom_sigmas` are provided, since the sigmas then determine the denoising strength. |
 | `mode_type` | COMBO | Dropdown | - | Linear, Chess, None | The tiling order to use for the redraw step. Linear processes tiles row by row, Chess uses a checkerboard pattern, and None skips the redraw step. |
 | `tile_width` | INT | Number Input | 512 | 64-8192 (step 8) | The base width of each tile during the redraw step. |
 | `tile_height` | INT | Number Input | 512 | 64-8192 (step 8) | The base height of each tile during the redraw step. |
 | `mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the mask applied to tiles, helping blend tiles seamlessly. A higher value means more of the original image is retained near the seams when pasting the refined tiles back on the upscaled image. |
 | `tile_padding` | INT | Number Input | 32 | 0-8192 (step 8) | The padding to apply to tiles, providing more context for better blending. Adds to tile size (e.g. (`tile_width` + `tile_padding`)x(`tile_height` + `tile_padding`)). |
 | `seam_fix_mode` | COMBO | Dropdown | - | None, Band Pass, Half Tile, Half Tile + Intersections | The seam fix mode to use. Different modes apply different strategies to fix visible seams between tiles. |
-| `seam_fix_denoise` | FLOAT | Slider | 1.0 | 0.0-1.0 (step 0.01) | The denoising strength to use for the seam fix step. |
+| `seam_fix_denoise` | FLOAT | Slider | 1.0 | 0.0-1.0 (step 0.01) | The denoising strength to use for the seam fix step. This replaces `denoise` for the seam fix passes only; the redraw step keeps using `denoise`. Ignored when both `custom_sampler` and `custom_sigmas` are provided, since the sigmas then determine the denoising strength for every pass. |
 | `seam_fix_width` | INT | Number Input | 64 | 0-8192 (step 8) | The width of the bands used for the Band Pass seam fix mode. |
 | `seam_fix_mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the seam fix mask, ensuring smooth blending. |
 | `seam_fix_padding` | INT | Number Input | 16 | 0-8192 (step 8) | The padding to apply for the seam fix step. Adds to tile size. |
