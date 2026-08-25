@@ -29,7 +29,7 @@ After the redraw step, the seam fix step is applied if enabled. There are variou
 | `mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the mask applied to tiles, helping blend tiles seamlessly. A higher value means more of the original image is retained near the seams when pasting the refined tiles back on the upscaled image. |
 | `tile_padding` | INT | Number Input | 32 | 0-8192 (step 8) | The padding to apply to tiles, providing more context for better blending. Adds to tile size (e.g. (`tile_width` + `tile_padding`)x(`tile_height` + `tile_padding`)). |
 | `seam_fix_mode` | COMBO | Dropdown | - | None, Band Pass, Half Tile, Half Tile + Intersections | The seam fix mode to use. Different modes apply different strategies to fix visible seams between tiles. |
-| `seam_fix_denoise` | FLOAT | Slider | 1.0 | 0.0-1.0 (step 0.01) | The denoising strength to use for the seam fix step. |
+| `seam_fix_denoise` | FLOAT | Slider | 1.0 | 0.0-1.0 (step 0.01) | The denoising strength to use for the seam fix step. This replaces `denoise` for the seam fix passes only; the redraw step keeps using `denoise`. |
 | `seam_fix_width` | INT | Number Input | 64 | 0-8192 (step 8) | The width of the bands used for the Band Pass seam fix mode. |
 | `seam_fix_mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the seam fix mask, ensuring smooth blending. |
 | `seam_fix_padding` | INT | Number Input | 16 | 0-8192 (step 8) | The padding to apply for the seam fix step. Adds to tile size. |
