@@ -221,11 +221,24 @@ def check_model(model):
     """Fail early on models whose conditioning is built for the whole image."""
     inner = getattr(model, "model", None)
     concat_cond = getattr(type(inner), "concat_cond", None)
-    assert concat_cond is None or concat_cond is comfy.model_base.BaseModel.concat_cond, (
-        f"{type(inner).__name__} builds an image sized extra conditioning of its own (inpainting and "
-        f"instruct style models do this), which cannot be split between the tiles. Use the regular "
-        f"Ultimate SD Upscale (No Upscale) node for it."
-    )
+    if concat_cond is not None and concat_cond is not comfy.model_base.BaseModel.concat_cond:
+        # Model families override concat_cond for their fill / inpaint / control lora editions, but
+        # the plain editions return None from the same method (Flux and Flux2 decide by the channel
+        # count of their input layer). Probe it with an empty conditioning: only a model that builds
+        # an image sized concat on its own is a problem for the tiles.
+        try:
+            channels = getattr(getattr(inner, "latent_format", None), "latent_channels", 16)
+            probe = torch.zeros(1, channels, 8, 8)
+            built = inner.concat_cond(noise=probe, device=torch.device("cpu"))
+        except Exception:
+            # Cannot tell from here; the conditioning checks still refuse concat_latent_image
+            logger.debug("Could not probe concat_cond, relying on the conditioning checks", exc_info=True)
+            built = None
+        assert built is None, (
+            f"{type(inner).__name__} builds an image sized extra conditioning of its own (inpainting "
+            f"and fill style models do this), which cannot be split between the tiles. Use the regular "
+            f"Ultimate SD Upscale (No Upscale) node for it."
+        )
 
     if model.model_options.get("sampler_post_cfg_function"):
         logger.warning(
