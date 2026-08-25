@@ -291,6 +291,46 @@ def center_crop_to_multiple(image: torch.Tensor, multiple: int) -> Tuple[torch.T
     return cropped, (x_offset, y_offset)
 
 
+def merge_tile_prompts(positive_cropped, tile_prompts, fallback):
+    """
+    Give each tile its own text prompt.
+
+    The four tiles are sampled as one batch, so the text embeddings can be stacked along the
+    batch dimension the same way the per tile reference latents are: tile i then attends to
+    row i of the stack. Tiles without their own prompt fall back to the main positive.
+
+    Only the text embedding is taken from the per tile inputs. Everything else on the
+    conditioning (guidance, controlnet, reference latents) comes from the main positive, so
+    the per tile prompts stay simple text encodes.
+    """
+    if not any(p is not None for p in tile_prompts):
+        return positive_cropped
+
+    names = ("top left", "top right", "bottom left", "bottom right")
+    embeddings = []
+    for name, prompt in zip(names, tile_prompts):
+        source = prompt if prompt is not None else fallback
+        if len(source) > 1:
+            logger.warning("The %s tile prompt has %d conditioning entries, only the first is used",
+                           name, len(source))
+        embeddings.append(source[0][0][:1])
+
+    # Prompts of different lengths are stacked by padding the shorter ones with empty tokens at
+    # the front, which is how Flux.2 pads short prompts itself
+    max_tokens = max(e.shape[1] for e in embeddings)
+    embeddings = [
+        F.pad(e, (0, 0, max_tokens - e.shape[1], 0)) if e.shape[1] < max_tokens else e
+        for e in embeddings
+    ]
+    stacked = torch.cat(embeddings, dim=0)
+
+    if len(positive_cropped) > 1:
+        logger.warning("The positive conditioning has %d entries, the per tile prompts only replace "
+                       "the text of the first", len(positive_cropped))
+    return [[stacked if i == 0 else emb, cond_dict]
+            for i, (emb, cond_dict) in enumerate(positive_cropped)]
+
+
 def build_reference_latent(vae, reference_image: Optional[torch.Tensor],
                            canvas_latent: torch.Tensor, canvas_pixels: torch.Tensor) -> torch.Tensor:
     """
@@ -333,6 +373,7 @@ def redraw(
     mask: Optional[torch.Tensor] = None,
     use_mask: bool = False,
     color_match: float = 0.0,
+    tile_prompts: Optional[List] = None,
 ) -> torch.Tensor:
     """
     Refine an image as four overlapping tiles sampled as one batch, and return the result.
@@ -380,6 +421,9 @@ def redraw(
                                  latent_scale=latent_scale)
     negative_cropped = crop_cond(negative, pixel_regions, canvas_size, canvas_size, tile_pixel_size,
                                  latent_scale=latent_scale)
+
+    if tile_prompts is not None:
+        positive_cropped = merge_tile_prompts(positive_cropped, tile_prompts, positive)
 
     if tile_reference_latent:
         reference_latent = build_reference_latent(vae, reference_image, canvas_latent, canvas_pixels)

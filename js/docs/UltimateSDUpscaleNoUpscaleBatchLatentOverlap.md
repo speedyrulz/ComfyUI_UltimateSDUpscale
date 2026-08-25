@@ -43,6 +43,10 @@ Because the tiles share one latent and one noise field, they never diverge in th
 | `reference_image` | IMAGE | Image Input | None | - | Optional image to take the reference tiles from. Defaults to the image being refined. |
 | `use_mask` | BOOLEAN | Toggle | False | True/False | Only refine the area covered by the `mask` input. The mask limits the denoising of the redraw and limits what is written back over the original image. |
 | `mask` | MASK | Mask Input | None | - | The area to refine: white is refined, black is left untouched. Only used when `use_mask` is enabled. Resized to the size of the image if it does not already match. |
+| `positive_top_left` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the top left tile. Tiles without their own prompt use the main `positive`. Only the text is taken from these inputs; guidance, controlnet and reference latents still come from the main `positive`. |
+| `positive_top_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the top right tile. |
+| `positive_bottom_left` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom left tile. |
+| `positive_bottom_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom right tile. |
 | `color_match` | FLOAT | Number Input | 0.00 | 0.0-1.0 (step 0.05) | Pull the colours of the result back towards the input image. Each channel is rescaled to the mean and standard deviation of the input, which corrects an overall tint or exposure shift without flattening the generated detail. The shift is measured only over the parts of the image the edit left alone, so recolouring something in the picture does not drag the rest of the image towards its old colour. 0.00 leaves the model's colours alone, 1.00 matches the input fully. |
 
 ## Outputs
@@ -75,7 +79,12 @@ Because the tiles share one latent and one noise field, they never diverge in th
 	- Start around 0.50 to 0.80. Use 1.00 when the result should be indistinguishable in colour from the input, which is the usual choice when the edit is a local one.
 	- If the edit changes nearly the entire image there is nothing dependable left to measure, and the correction is skipped with a warning rather than applied from unreliable statistics.
 
-6. **Conditioning that cannot be split**
+6. **Per tile prompts**
+	- The four `positive_<corner>` inputs give each tile its own text prompt: the four tiles are sampled as one batch, so each tile attends to its own prompt row while still being averaged with its neighbours in the overlaps. Describe what actually sits in that quarter of the image and the shared overlap keeps the quarters consistent with each other.
+	- Any tile left unconnected uses the main `positive`. Prompts of different lengths are aligned by padding the shorter ones with empty tokens, the same way Flux.2 pads short prompts itself.
+	- The per tile inputs are text only: guidance, controlnet hints and reference latents always come from the main `positive`, and the negative applies to all tiles. The seam fix step, if enabled, also uses the main `positive`.
+
+7. **Conditioning that cannot be split**
 	- Conditioning that is built for the whole image is rejected up front rather than failing part way through sampling: inpainting conditioning carrying a whole-image latent (`concat_latent_image`), and area or mask conditioning (`ConditioningSetArea`, `ConditioningSetMask`), which ComfyUI resizes to the latent being sampled and so cannot be cropped per tile here.
 	- Models that build an image-sized conditioning of their own, such as inpainting and instruct-style models, are rejected for the same reason.
 	- GLIGEN conditioning can only be cropped for one region by this pack, so every tile is given the first tile's positions. A warning is logged when that happens.

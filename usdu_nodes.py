@@ -304,6 +304,9 @@ class UltimateSDUpscaleNoUpscaleBatchLatentOverlap(UltimateSDUpscaleNoUpscale):
         optional.insert(1, ("latent", ("LATENT", {"tooltip": "The latent to refine. Used when input_mode is set to latent, and decoded to an image before the redraw starts."})))
         optional.append(("use_mask", ("BOOLEAN", {"default": False, "tooltip": "Only refine the area covered by the mask input. The mask limits the denoising of the redraw and limits what is pasted back over the original image."})))
         optional.append(("mask", ("MASK", {"tooltip": "The area to refine, white is refined and black is left untouched. Only used when use_mask is enabled. Resized to the size of the image if it does not already match."})))
+        for corner in ("top_left", "top_right", "bottom_left", "bottom_right"):
+            label = corner.replace("_", " ")
+            optional.append((f"positive_{corner}", ("CONDITIONING", {"tooltip": f"Optional prompt for the {label} tile. Tiles without their own prompt use the main positive. Only the text is taken from this input; guidance, controlnet and reference latents still come from the main positive."})))
         optional.append(("color_match", ("FLOAT", {"default": 0.00, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Pull the colours of the result back towards the input image. Edit models tend to shift the whole image in tint and contrast, which shows against the rest of the picture. Each channel is rescaled to the mean and standard deviation of the input, correcting an overall shift without flattening the detail that was generated. The shift is measured only over the parts of the image the edit left alone, so recolouring something in the picture does not drag everything else towards its old colour. 0.00 leaves the model's colours alone, 0.50 to 0.80 corrects a drift while leaving the edit its own look, 1.00 matches the input fully."})))
         return prepare_inputs(required, optional)
 
@@ -320,7 +323,9 @@ class UltimateSDUpscaleNoUpscaleBatchLatentOverlap(UltimateSDUpscaleNoUpscale):
                 seam_fix_width, seam_fix_padding, tiled_decode,
                 input_mode="image", upscaled_image=None, latent=None,
                 tile_reference_latent=False, reference_strength=1.0, reference_image=None,
-                use_mask=False, mask=None, color_match=0.0):
+                use_mask=False, mask=None, color_match=0.0,
+                positive_top_left=None, positive_top_right=None,
+                positive_bottom_left=None, positive_bottom_right=None):
         image = self.get_input_image(input_mode, upscaled_image, latent, vae, tiled_decode)
 
         redrawn = batch_latent_overlap_redraw(
@@ -328,6 +333,8 @@ class UltimateSDUpscaleNoUpscaleBatchLatentOverlap(UltimateSDUpscaleNoUpscale):
             denoise, tile_padding, tiled_decode,
             tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
             reference_image=reference_image, mask=mask, use_mask=use_mask, color_match=color_match,
+            tile_prompts=[positive_top_left, positive_top_right,
+                          positive_bottom_left, positive_bottom_right],
         )
 
         if SEAM_FIX_MODES[seam_fix_mode].value == usdu.USDUSFMode.NONE.value:
