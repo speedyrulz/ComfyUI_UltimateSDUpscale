@@ -33,7 +33,7 @@ Because the tiles share one latent and one noise field, they never diverge in th
 | `tile_padding` | INT | Number Input | 32 | 8-8192 (step 8) | How far each tile reaches into its neighbours. Neighbouring tiles overlap by twice this amount, and that overlap is what gets averaged after every step. Larger values give the tiles more shared context to agree on, at the cost of a larger tile and so more VRAM and time. |
 | `mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the mask used by the seam fix step. Has no effect on the redraw, which has no per-tile masks to blend. |
 | `seam_fix_mode` | COMBO | Dropdown | None | None, Band Pass, Half Tile, Half Tile + Intersections | The seam fix mode. The redraw does not create seams, so this is normally left at `None`. When it is set, the redrawn image is passed to the regular pipeline with the redraw step disabled, and only the seam fix runs, over the same 2x2 tile grid. |
-| `seam_fix_denoise` | FLOAT | Slider | 1.0 | 0.0-1.0 (step 0.01) | The denoising strength for the seam fix step. Note that this fork samples the seam fix at `denoise`, so this widget currently has no effect on any of the nodes. |
+| `seam_fix_denoise` | FLOAT | Slider | 1.0 | 0.0-1.0 (step 0.01) | The denoising strength for the seam fix step. |
 | `seam_fix_width` | INT | Number Input | 64 | 0-8192 (step 8) | The width of the bands used for the Band Pass seam fix mode. |
 | `seam_fix_mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the seam fix mask. |
 | `seam_fix_padding` | INT | Number Input | 16 | 0-8192 (step 8) | The padding to apply for the seam fix tiles. |
