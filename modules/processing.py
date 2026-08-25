@@ -1,5 +1,6 @@
-from PIL import Image, ImageFilter, ImageDraw
+from PIL import Image, ImageChops, ImageFilter, ImageDraw
 import logging
+import numpy as np
 import torch
 import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
@@ -67,6 +68,8 @@ class StableDiffusionProcessing:
         tile_reference_latent=False,
         reference_image=None,
         reference_strength=1.0,
+        mask=None,
+        use_mask=False,
     ):
         # Variables used by the USDU script
         self.init_images = [init_img]
@@ -97,6 +100,10 @@ class StableDiffusionProcessing:
         self.tile_reference_latent = tile_reference_latent
         self.reference_image = reference_image
         self.reference_strength = reference_strength
+
+        # Optional mask limiting which parts of the image are processed
+        self.mask = mask if use_mask else None
+        self.use_mask = use_mask and mask is not None
 
         # Optional custom sampler and sigmas
         self.custom_sampler = custom_sampler
@@ -211,13 +218,18 @@ def sample_with_guider(guider, sampler, sigmas, seed, latent):
     return {"samples": samples}
 
 
-def get_latent_scale(p: StableDiffusionProcessing) -> int:
+def get_vae_latent_scale(vae) -> int:
     """The pixel -> latent downscale factor of the VAE (8 for SD/Flux.1, 16 for Flux.2)."""
     try:
-        return int(p.vae.spacial_compression_encode())
+        return int(vae.spacial_compression_encode())
     except Exception:
         logger.debug("Could not query the VAE compression ratio, assuming 8")
         return 8
+
+
+def get_latent_scale(p: StableDiffusionProcessing) -> int:
+    """The pixel -> latent downscale factor of the VAE in use."""
+    return get_vae_latent_scale(p.vae)
 
 
 def reference_strength_patch(strength: float):
@@ -348,6 +360,46 @@ def guider_reference_latents(p: StableDiffusionProcessing, guider, reference_lat
             conds[key] = cond_list
 
 
+def get_mask_image(p: StableDiffusionProcessing, canvas_size, image_index=0):
+    """
+    The processing mask for one image of the batch, as a PIL 'L' image the size of the canvas.
+
+    The mask is given at the resolution of the image it was made for, so it is resized to the
+    canvas once here and then cropped per tile, which is what lines the mask splits up with
+    the tiles of the original image.
+    """
+    if not p.use_mask:
+        return None
+
+    mask = p.mask
+    if mask.ndim == 4:
+        # (B, H, W, 1) or (B, 1, H, W)
+        mask = mask[..., 0] if mask.shape[-1] == 1 else mask[:, 0]
+    elif mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+
+    index = min(image_index, mask.shape[0] - 1)
+    array = (mask[index].clamp(0.0, 1.0).cpu().numpy() * 255.0).astype(np.uint8)
+    mask_image = Image.fromarray(array, mode='L')
+    if mask_image.size != tuple(canvas_size):
+        mask_image = mask_image.resize(canvas_size, Image.Resampling.BILINEAR)
+    return mask_image
+
+
+def get_tile_noise_mask(mask_image: Image.Image, crop_region, tile_size):
+    """The part of the mask covering one tile, as a (1, H, W) tensor for use as a noise mask."""
+    crop = mask_image.crop(crop_region)
+    if crop.size != tuple(tile_size):
+        crop = crop.resize(tile_size, Image.Resampling.BILINEAR)
+    array = np.array(crop).astype(np.float32) / 255.0
+    return torch.from_numpy(array).unsqueeze(0)
+
+
+def mask_is_empty(mask_image: Image.Image, crop_region):
+    """True when the mask does not cover any of the given region, so the tile can be skipped."""
+    return mask_image.crop(crop_region).getbbox() is None
+
+
 def process_images(p: StableDiffusionProcessing) -> Processed:
     # Where the main image generation happens in A1111
 
@@ -391,6 +443,15 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     if p.mask_blur > 0:
         image_mask = image_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
 
+    # The processing mask, split so that the part covering this tile lines up with the original image
+    mask_images = [get_mask_image(p, init_image.size, i) for i in range(len(shared.batch))]
+    if p.use_mask and all(mask_is_empty(m, crop_region) for m in mask_images):
+        # Nothing to process in this tile, leave it as it is
+        if p.progress_bar_enabled:
+            assert p.pbar is not None
+            p.pbar.update(1)
+        return Processed(p, [shared.batch[0]], p.seed, "")
+
     # Crop the images to get the tiles that will be used for generation
     tiles = [img.crop(crop_region) for img in shared.batch]
 
@@ -405,6 +466,10 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     # Encode the image
     batched_tiles = torch.cat([pil_to_tensor(tile) for tile in tiles], dim=0)
     (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
+
+    if p.use_mask:
+        latent["noise_mask"] = torch.cat(
+            [get_tile_noise_mask(m, crop_region, tile_size) for m in mask_images], dim=0)
 
     # Reference latent for the tile currently being generated
     reference_latent = get_tile_reference_latent(p, crop_region, init_image.size, tile_size, latent)
@@ -449,6 +514,11 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     for i, tile_sampled in enumerate(tiles_sampled):
         init_image = shared.batch[i]
 
+        # Only paste back what the mask covers, the decode changes pixels outside of it too
+        tile_alpha = image_mask
+        if p.use_mask:
+            tile_alpha = ImageChops.multiply(tile_alpha, mask_images[i])
+
         # Resize back to the original size
         if tile_sampled.size != initial_tile_size:
             tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
@@ -460,7 +530,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         # Add the mask as an alpha channel
         # Must make a copy due to the possibility of an edge becoming black
         temp = image_tile_only.copy()
-        temp.putalpha(image_mask)
+        temp.putalpha(tile_alpha)
         image_tile_only.paste(temp, image_tile_only)
 
         # Add back the tile to the initial image according to the mask in the alpha channel
@@ -498,8 +568,13 @@ def process_batch_tiles(
     batch_masks: List[Image.Image] = []
     batch_crop_regions: List[Tuple[int, int, int, int]] = []
     batch_tile_sizes: List[Tuple[int, int]] = []
+    batch_image_indices: List[int] = []
+    batch_noise_masks: List[torch.Tensor] = []
 
-    for image in images:
+    # The processing mask, split so that the part covering each tile lines up with the original image
+    mask_images = [get_mask_image(p, image.size, i) for i, image in enumerate(images)]
+
+    for image_index, image in enumerate(images):
         for tx, ty in tiles_coords:
             tile_mask = Image.new("L", (image.width, image.height), "black")
             tile_draw = ImageDraw.Draw(tile_mask)
@@ -532,6 +607,15 @@ def process_batch_tiles(
             if p.mask_blur > 0:
                 tile_mask = tile_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
 
+            if p.use_mask:
+                mask_image = mask_images[image_index]
+                if mask_is_empty(mask_image, crop_region):
+                    # Nothing to process in this tile, leave it as it is
+                    continue
+                # Only paste back what the mask covers, the decode changes pixels outside of it too
+                tile_mask = ImageChops.multiply(tile_mask, mask_image)
+                batch_noise_masks.append(get_tile_noise_mask(mask_image, crop_region, tile_size))
+
             cropped_tile = image.crop(crop_region)
             initial_tile_size = cropped_tile.size
             if cropped_tile.size != tile_size:
@@ -541,10 +625,21 @@ def process_batch_tiles(
             batch_masks.append(tile_mask)
             batch_crop_regions.append(crop_region)
             batch_tile_sizes.append(tile_size)
+            batch_image_indices.append(image_index)
+
+    if not batch_tiles:
+        # Every tile of this batch is outside of the mask
+        if p.progress_bar_enabled:
+            assert p.pbar is not None
+            p.pbar.update(len(tiles_coords))
+        return images
 
     # Encode all tiles into a single latent batch
     batched_tensors = torch.cat([pil_to_tensor(tile) for tile, _ in batch_tiles], dim=0)
     (latent,) = p.vae_encoder.encode(p.vae, batched_tensors)
+
+    if batch_noise_masks:
+        latent["noise_mask"] = torch.cat(batch_noise_masks, dim=0)
 
     first_tile_size = batch_tile_sizes[0]
 
@@ -587,27 +682,26 @@ def process_batch_tiles(
 
     # Composite each decoded tile back onto its source image
     result_imgs = list(images)
-    for i, result_img in enumerate(result_imgs):
-        for j in range(len(tiles_coords)):
-            idx = i * len(tiles_coords) + j
-            tile_sampled = tensor_to_pil(decoded, idx)
-            initial_tile_size = batch_tiles[idx][1]
-            crop_region = batch_crop_regions[idx]
-            tile_mask = batch_masks[idx]
+    for idx in range(len(batch_tiles)):
+        i = batch_image_indices[idx]
+        result_img = result_imgs[i]
+        tile_sampled = tensor_to_pil(decoded, idx)
+        initial_tile_size = batch_tiles[idx][1]
+        crop_region = batch_crop_regions[idx]
+        tile_mask = batch_masks[idx]
 
-            if tile_sampled.size != initial_tile_size:
-                tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
+        if tile_sampled.size != initial_tile_size:
+            tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
 
-            image_tile_only = Image.new('RGBA', result_img.size)
-            image_tile_only.paste(tile_sampled, crop_region[:2])
+        image_tile_only = Image.new('RGBA', result_img.size)
+        image_tile_only.paste(tile_sampled, crop_region[:2])
 
-            temp = image_tile_only.copy()
-            temp.putalpha(tile_mask)
-            image_tile_only.paste(temp, image_tile_only)
+        temp = image_tile_only.copy()
+        temp.putalpha(tile_mask)
+        image_tile_only.paste(temp, image_tile_only)
 
-            result = result_img.convert('RGBA')
-            result.alpha_composite(image_tile_only)
-            result_img = result.convert('RGB')
-            result_imgs[i] = result_img
+        result = result_img.convert('RGBA')
+        result.alpha_composite(image_tile_only)
+        result_imgs[i] = result.convert('RGB')
 
     return result_imgs

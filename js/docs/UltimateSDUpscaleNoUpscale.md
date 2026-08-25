@@ -13,7 +13,9 @@ After the redraw step, the seam fix step is applied if enabled. There are variou
 
 | Parameter | Data Type | Input Method | Default | Range | Description |
 |-----------|-----------|--------------|---------|--------|-------------|
-| `upscaled_image` | IMAGE | Image Input | None | - | The already upscaled image to refine with tiled processing. |
+| `input_mode` | COMBO | Dropdown | image | image, latent | Whether to take the image to refine from the `upscaled_image` input or from the `latent` input. A latent is decoded once with the given VAE before the tiling starts, using tiled decoding if `tiled_decode` is enabled. |
+| `upscaled_image` | IMAGE | Image Input | None | - | The already upscaled image to refine with tiled processing. Used when `input_mode` is set to image. |
+| `latent` | LATENT | Latent Input | None | - | The latent to refine with tiled processing. Used when `input_mode` is set to latent. |
 | `model` | MODEL | Model Selection | None | - | The model to use for image-to-image processing on each tile. |
 | `positive` | CONDITIONING | Conditioning Input | None | - | The positive conditioning for each tile during the redraw step. |
 | `negative` | CONDITIONING | Conditioning Input | None | - | The negative conditioning for each tile during the redraw step. |
@@ -39,6 +41,8 @@ After the redraw step, the seam fix step is applied if enabled. There are variou
 | `tile_reference_latent` | BOOLEAN | Toggle | False | True/False | Use the region of the image matching the tile currently being generated as that tile's reference latent. Needed for reference latent models such as Flux.2 Klein, Flux.1 Kontext and Qwen Image Edit: supplying a reference latent through the conditioning instead makes every tile use the whole image as its reference, which gives poor results. Replaces any reference latents already on the positive conditioning. |
 | `reference_strength` | FLOAT | Number Input | 1.00 | 0.0-5.0 (step 0.05) | How strongly the reference latent influences each tile. The reference latents are appended to the token sequence, so this scales the attention keys and values of the reference image tokens in every block, the same way the FLUX.2 Klein reference latent controller nodes do it. 1.00 leaves the reference as is, lower values weaken it, 0.00 ignores it, and higher values strengthen it. Also applies to reference latents supplied through the conditioning. |
 | `reference_image` | IMAGE | Image Input | None | - | Optional image to take the reference tiles from when `tile_reference_latent` is enabled. Defaults to the image being upscaled. Can be any resolution: the region corresponding to the current tile is cropped and resized to the tile size before being encoded. |
+| `use_mask` | BOOLEAN | Toggle | False | True/False | Only refine the area covered by the `mask` input. The mask limits the denoising of every tile and limits what is pasted back, and tiles the mask does not cover at all are skipped entirely. |
+| `mask` | MASK | Mask Input | None | - | The area to refine: white is refined, black is left untouched. Only used when `use_mask` is enabled. It is split between the tiles so that each tile is masked by the part of the mask lining up with it, and is resized to the size of the image first if it does not already match. |
 
 ## Outputs
 
