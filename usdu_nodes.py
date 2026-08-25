@@ -8,6 +8,7 @@ from usdu_patch import usdu
 from usdu_utils import tensor_to_pil, pil_to_tensor
 from modules.processing import StableDiffusionProcessing, get_vae_latent_scale
 from batch_latent_overlap import redraw as batch_latent_overlap_redraw
+from tile_prompts import UltimateSDUpscaleTilePrompts
 from nodes import VAEDecode, VAEDecodeTiled
 import modules.shared as shared
 from modules.upscaler import UpscalerData
@@ -458,6 +459,7 @@ NODE_CLASS_MAPPINGS = {
     "UltimateSDUpscaleNoUpscaleBatchLatentOverlap": UltimateSDUpscaleNoUpscaleBatchLatentOverlap,
     "UltimateSDUpscaleCustomSample": UltimateSDUpscaleCustomSample,
     "UltimateSDUpscaleGuider": UltimateSDUpscaleGuider,
+    "UltimateSDUpscaleTilePrompts": UltimateSDUpscaleTilePrompts,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -467,4 +469,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UltimateSDUpscaleNoUpscaleBatchLatentOverlap": "Ultimate SD Upscale (No Upscale - Batch Latent Overlap)",
     "UltimateSDUpscaleCustomSample": "Ultimate SD Upscale (Custom Sample)",
     "UltimateSDUpscaleGuider": "Ultimate SD Upscale (Guider)",
+    "UltimateSDUpscaleTilePrompts": "Ultimate SD Upscale Tile Prompts",
 }
