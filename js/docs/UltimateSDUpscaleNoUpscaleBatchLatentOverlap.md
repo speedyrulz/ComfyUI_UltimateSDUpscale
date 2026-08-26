@@ -47,7 +47,7 @@ Because the tiles share one latent and one noise field, they never diverge in th
 | `positive_top_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the top right tile. |
 | `positive_bottom_left` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom left tile. |
 | `positive_bottom_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom right tile. |
-| `color_match` | FLOAT | Number Input | 0.00 | 0.0-1.0 (step 0.05) | Pull the colours of the redrawn area back towards the input image. Each channel is shifted and rescaled so that what was redrawn sits where the original did, correcting the tint and exposure drift edit models are prone to. The measurement is a median taken over the area that was actually redrawn, which is the masked area when a mask is used, so a deliberate recolour of part of that area barely moves it and the correction that comes out is the drift the rest of the area shares. 0.00 leaves the model's colours alone, 1.00 matches the input fully. |
+| `color_match` | FLOAT | Number Input | 0.00 | 0.0-1.0 (step 0.05) | Pull the colours of the redrawn area back towards the input image. Each channel is both shifted and rescaled, so tint and saturation are put back together: edit models tend to return an image that is not only warmer but more saturated and contrasty than what went in. Both measurements are quantiles taken over the area that was actually redrawn, the masked area when a mask is used, so something deliberately recoloured barely moves them and keeps its new colour. 0.00 leaves the model's colours alone, 1.00 matches the input fully. |
 
 ## Outputs
 
@@ -76,8 +76,9 @@ Because the tiles share one latent and one noise field, they never diverge in th
 5. **Colour shifts**
 	- Edit models drift: what comes back is tinted, warmer or flatter than what went in. With a mask this is at its most obvious, because the redrawn area sits directly against untouched pixels that did not drift with it.
 	- `color_match` corrects that drift, and for a masked edit it is measured inside the mask, which is the only place the drift exists. Turn it up to 1.00 for a masked edit where the result should be indistinguishable in colour from its surroundings; 0.50 to 0.80 leaves the edit some colour of its own.
-	- It uses a median rather than an average, so an edit that deliberately recolours part of the area keeps its new colour: a recoloured object is a minority of the pixels and barely moves the median, while the drift the rest of the area shares is what gets corrected.
-	- The correction is capped, so even an area that was rewritten from top to bottom, where there is no shared drift to find, cannot pull the picture far.
+	- It corrects saturation as well as tint. Klein and models like it usually come back both warmer and more saturated, and a shift alone cannot put that back, so each channel is rescaled as well as shifted.
+	- It uses quantiles rather than averages, so an edit that deliberately recolours part of the area keeps its new colour: a recoloured object is a minority of the pixels and sits out in the tails, where it barely moves the measurement. No pixel is moved further than a fixed cap either, so such a colour cannot be pulled all the way back.
+	- Judge the result from the decoded image, not from the preview during sampling. That preview is a crude linear projection of the latent that clips at both ends, so it consistently looks less saturated and better behaved than what the VAE actually produces.
 
 6. **Per tile prompts**
 	- The four `positive_<corner>` inputs give each tile its own text prompt: the four tiles are sampled as one batch, so each tile attends to its own prompt row while still being averaged with its neighbours in the overlaps. Describe what actually sits in that quarter of the image and the shared overlap keeps the quarters consistent with each other.

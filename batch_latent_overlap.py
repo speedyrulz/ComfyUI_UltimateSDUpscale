@@ -519,21 +519,37 @@ def changed_region_pixels(refined: torch.Tensor, source: torch.Tensor,
     return flat_refined, flat_source
 
 
+# The points of the colour distribution that are measured: the middle, and a spread taken well
+# inside the extremes. Both are robust, which is what lets this coexist with an edit that
+# deliberately changes a colour: that colour is a minority of the pixels and sits out in the tails,
+# so it barely moves either measurement.
+LOW_QUANTILE, HIGH_QUANTILE = 0.15, 0.85
+
+# No pixel may be moved further than this by the correction, whatever the measurement says. A drift
+# is a small move for most of the picture, so this bites only where an edit deliberately put a
+# colour far from anything in the original, and keeps that colour from being pulled all the way back.
+MAX_COLOR_MOVE = 0.20
+
+# How far the spread of a channel may be rescaled. Wide, because an edit model can come back a good
+# deal more saturated than what went in, and correcting that is most of the point of this.
+MIN_COLOR_GAIN, MAX_COLOR_GAIN = 0.5, 2.0
+
+
 def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float,
                  mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Pull the colours of the redrawn area back towards the image it came from.
 
-    Edit models drift: what comes back is tinted or lifted compared to what went in, which shows up
-    against the parts of the picture that were not redrawn. Each channel is shifted and rescaled so
-    that the redrawn area sits where the original did.
+    Edit models drift, and not only in tint: what comes back is often more saturated and more
+    contrasty than what went in. Each channel is therefore both shifted and rescaled, so that its
+    middle and its spread sit where the original's did, which puts back the tint and the saturation
+    together without touching the detail that was generated.
 
-    The measurement is a median, not a mean, and it is taken over the area that was actually
-    redrawn. Using the median is what lets this coexist with an edit that deliberately changes
-    something: recoloured clothing is a minority of the pixels, so it barely moves the median, and
-    the correction that comes out is the drift the rest of the area shares rather than the colour of
-    the thing that was changed. The correction is also capped, so an area that really was rewritten
-    from top to bottom cannot pull the picture far.
+    Both measurements are quantiles taken over the area that was actually redrawn, which is the
+    masked area when there is a mask. Quantiles rather than averages, and a spread taken well inside
+    the extremes, so that something deliberately recoloured barely moves them; and no pixel is moved
+    further than MAX_COLOR_MOVE whatever the measurement says, which keeps such a colour from being
+    pulled all the way back to the original.
 
     *strength* blends between the model's own colours (0.0) and a full match (1.0).
     """
@@ -548,24 +564,30 @@ def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float,
         logger.warning("Skipping the colour match, there is too little of the image to measure")
         return refined
 
-    refined_middle = sampled_refined.median(dim=0).values
-    source_middle = sampled_source.median(dim=0).values
-    refined_spread = (sampled_refined - refined_middle).abs().median(dim=0).values
-    source_spread = (sampled_source - source_middle).abs().median(dim=0).values
+    points = torch.tensor([LOW_QUANTILE, 0.5, HIGH_QUANTILE],
+                          device=sampled_refined.device, dtype=torch.float32)
+    refined_points = torch.quantile(sampled_refined, points, dim=0)
+    source_points = torch.quantile(sampled_source, points, dim=0)
 
-    # A cap on both halves of the correction: a drift is a nudge, and anything bigger than this is
-    # the measurement being wrong rather than the model being that far off
-    offset = (source_middle - refined_middle).clamp(-0.15, 0.15)
+    refined_middle, source_middle = refined_points[1], source_points[1]
+    refined_spread = refined_points[2] - refined_points[0]
+    source_spread = source_points[2] - source_points[0]
+
+    # A flat area has no spread to line up, and rescaling by a ratio of two near zero numbers would
+    # be meaningless. Shifting it is still right, so leave the gain alone and let the shift do it.
     measurable = (refined_spread > 1e-3) & (source_spread > 1e-3)
-    scale = torch.where(measurable, source_spread / refined_spread.clamp(min=1e-3),
-                        torch.ones_like(source_spread)).clamp(0.75, 1.333)
+    gain = torch.where(measurable, source_spread / refined_spread.clamp(min=1e-3),
+                       torch.ones_like(source_spread)).clamp(MIN_COLOR_GAIN, MAX_COLOR_GAIN)
 
     shape = (1, 1, 1, refined.shape[-1])
-    matched = (refined - refined_middle.reshape(shape)) * scale.reshape(shape)         + (refined_middle + offset).reshape(shape)
+    matched = (refined - refined_middle.reshape(shape)) * gain.reshape(shape) + source_middle.reshape(shape)
 
-    logger.debug("Colour match over %d pixels: offset %s, scale %s",
-                 sampled_refined.shape[0], offset.tolist(), scale.tolist())
-    return torch.lerp(refined, matched.clamp(0.0, 1.0), strength)
+    move = (matched - refined).clamp(-MAX_COLOR_MOVE, MAX_COLOR_MOVE)
+    logger.info("Colour matched over %d pixels: shift %s, gain %s",
+                sampled_refined.shape[0],
+                [round(v, 3) for v in (source_middle - refined_middle).tolist()],
+                [round(v, 3) for v in gain.tolist()])
+    return torch.lerp(refined, (refined + move).clamp(0.0, 1.0), strength)
 
 
 def composite(image: torch.Tensor, decoded: torch.Tensor, offset: Tuple[int, int],
