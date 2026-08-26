@@ -586,7 +586,7 @@ def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float,
     gain = torch.where(measurable, source_spread / refined_spread.clamp(min=1e-3),
                        torch.ones_like(source_spread)).clamp(MIN_COLOR_GAIN, MAX_COLOR_GAIN)
 
-    if float((source_middle - refined_middle).abs().max()) < 0.008 and float((gain - 1.0).abs().max()) < 0.05:
+    if float((source_middle - refined_middle).abs().max()) < 0.015 and float((gain - 1.0).abs().max()) < 0.10:
         # No real drift to correct: applying the measurement noise would only add a small error
         logger.debug("Skipping the colour match, the colours already agree")
         return refined

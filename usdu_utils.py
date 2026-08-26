@@ -565,14 +565,16 @@ def crop_reference_latents(cond_dict, regions, init_size, canvas_size, tile_size
 
 def set_reference_latents(cond, reference_latent):
     """
-    Return a copy of *cond* where every entry uses *reference_latent* as its only
-    reference latent. Used for the per-tile reference latents so that each tile is
-    conditioned on the matching region of the reference image instead of the whole image.
+    Return a copy of *cond* where every entry uses *reference_latent* as its reference
+    latents: a single tensor for one reference, or a list of tensors for several. Used for
+    the per-tile reference latents so that each tile is conditioned on the matching region
+    of the reference image instead of the whole image.
     """
+    latents = reference_latent if isinstance(reference_latent, list) else [reference_latent]
     out = []
     for emb, cond_dict in cond:
         cond_dict = cond_dict.copy()
-        cond_dict["reference_latents"] = [reference_latent]
+        cond_dict["reference_latents"] = list(latents)
         out.append([emb, cond_dict])
     return out
 
