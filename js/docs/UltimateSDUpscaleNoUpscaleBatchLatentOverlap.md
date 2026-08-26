@@ -33,7 +33,7 @@ Because the tiles share one latent and one noise field, they never diverge in th
 | `tile_padding` | INT | Number Input | 32 | 8-8192 (step 8) | How far each tile reaches into its neighbours. Neighbouring tiles overlap by twice this amount, and that overlap is what gets averaged after every step. Larger values give the tiles more shared context to agree on, at the cost of a larger tile and so more VRAM and time. |
 | `mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the mask used by the seam fix step. Has no effect on the redraw, which has no per-tile masks to blend. |
 | `seam_fix_mode` | COMBO | Dropdown | None | None, Band Pass, Half Tile, Half Tile + Intersections | The seam fix mode. The redraw does not create seams, so this is normally left at `None`. When it is set, the redrawn image is passed to the regular pipeline with the redraw step disabled, and only the seam fix runs, over the same 2x2 tile grid. |
-| `seam_fix_denoise` | FLOAT | Slider | 1.0 | 0.0-1.0 (step 0.01) | The denoising strength for the seam fix step. |
+| `seam_fix_denoise` | FLOAT | Slider | 0.35 | 0.0-1.0 (step 0.01) | The denoising strength for the seam fix step. It applies on top of the finished redraw, and with this node's 2x2 grid the seam fix bands cover most of the image, so high values largely repaint the redraw and shift its colours: keep this low. |
 | `seam_fix_width` | INT | Number Input | 64 | 0-8192 (step 8) | The width of the bands used for the Band Pass seam fix mode. |
 | `seam_fix_mask_blur` | INT | Number Input | 8 | 0-64 | The blur radius for the seam fix mask. |
 | `seam_fix_padding` | INT | Number Input | 16 | 0-8192 (step 8) | The padding to apply for the seam fix tiles. |
@@ -47,7 +47,7 @@ Because the tiles share one latent and one noise field, they never diverge in th
 | `positive_top_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the top right tile. |
 | `positive_bottom_left` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom left tile. |
 | `positive_bottom_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom right tile. |
-| `color_match` | FLOAT | Number Input | 0.00 | 0.0-1.0 (step 0.05) | Pull the colours of the redrawn area back towards the input image. Each channel is both shifted and rescaled, so tint and saturation are put back together: edit models tend to return an image that is not only warmer but more saturated and contrasty than what went in. Both measurements are quantiles taken over the area that was actually redrawn, the masked area when a mask is used, so something deliberately recoloured barely moves them and keeps its new colour. 0.00 leaves the model's colours alone, 1.00 matches the input fully. |
+| `color_match` | FLOAT | Number Input | 0.00 | 0.0-1.0 (step 0.05) | Pull the colours of the redrawn area back towards the input image. Each channel is both shifted and rescaled, so tint and saturation are put back together: edit models tend to return an image that is not only warmer but more saturated and contrasty than what went in. Both measurements are quantiles taken over the area that was actually redrawn, the masked area when a mask is used, so something deliberately recoloured barely moves them and keeps its new colour. 0.00 leaves the model's colours alone, 1.00 matches the input fully. Applied to the image that leaves the node, after the seam fix, and skipped when the colours already agree. |
 
 ## Outputs
 

@@ -7,7 +7,7 @@ import comfy
 from usdu_patch import usdu
 from usdu_utils import tensor_to_pil, pil_to_tensor
 from modules.processing import StableDiffusionProcessing, get_vae_latent_scale
-from batch_latent_overlap import redraw as batch_latent_overlap_redraw
+from batch_latent_overlap import apply_color_match, redraw as batch_latent_overlap_redraw
 from tile_prompts import UltimateSDUpscaleTilePrompts
 from nodes import VAEDecode, VAEDecodeTiled
 import modules.shared as shared
@@ -69,7 +69,7 @@ def USDU_base_inputs():
         ("tile_padding", ("INT", {"default": 32, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply between tiles."})),
         # Seam fix params
         ("seam_fix_mode", (list(SEAM_FIX_MODES.keys()), {"tooltip": "The seam fix mode to use."})),
-        ("seam_fix_denoise", ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The denoising strength to use for the seam fix."})),
+        ("seam_fix_denoise", ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The denoising strength to use for the seam fix. Applies on top of the redraw, so at high values the seam fix repaints most of the image again and can undo the redraw's colours and detail."})),
         ("seam_fix_width", ("INT", {"default": 64, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The width of the bands used for the Band Pass seam fix mode."})),
         ("seam_fix_mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the seam fix mask."})),
         ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
@@ -333,28 +333,32 @@ class UltimateSDUpscaleNoUpscaleBatchLatentOverlap(UltimateSDUpscaleNoUpscale):
             image, model, positive, negative, vae, seed, steps, cfg, sampler_name, scheduler,
             denoise, tile_padding, tiled_decode,
             tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
-            reference_image=reference_image, mask=mask, use_mask=use_mask, color_match=color_match,
+            reference_image=reference_image, mask=mask, use_mask=use_mask,
             tile_prompts=[positive_top_left, positive_top_right,
                           positive_bottom_left, positive_bottom_right],
         )
 
-        if SEAM_FIX_MODES[seam_fix_mode].value == usdu.USDUSFMode.NONE.value:
-            return (redrawn,)
+        if SEAM_FIX_MODES[seam_fix_mode].value != usdu.USDUSFMode.NONE.value:
+            # Hand the redrawn image to the normal pipeline with the redraw step turned off, so
+            # only the seam fix runs. The tiles it works from are the same 2x2 split.
+            logger.info("Running the %s seam fix at denoise %.2f", seam_fix_mode, seam_fix_denoise)
+            latent_scale = get_vae_latent_scale(vae)
+            tile_width = max(latent_scale, round(redrawn.shape[2] / 2 / latent_scale) * latent_scale)
+            tile_height = max(latent_scale, round(redrawn.shape[1] / 2 / latent_scale) * latent_scale)
+            (redrawn,) = UltimateSDUpscale.upscale(
+                self, redrawn, model, positive, negative, vae, 1.0, seed,
+                steps, cfg, sampler_name, scheduler, denoise, None,
+                "None", tile_width, tile_height, mask_blur, tile_padding,
+                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
+                seam_fix_width, seam_fix_padding, True, tiled_decode, 1,
+                tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
+                reference_image=reference_image, mask=mask, use_mask=use_mask,
+            )
 
-        # Hand the redrawn image to the normal pipeline, with the redraw step turned off, so that
-        # the seam fix runs with the usual settings. The tiles it works from are the same 2x2 split.
-        latent_scale = get_vae_latent_scale(vae)
-        tile_width = max(latent_scale, round(redrawn.shape[2] / 2 / latent_scale) * latent_scale)
-        tile_height = max(latent_scale, round(redrawn.shape[1] / 2 / latent_scale) * latent_scale)
-        return UltimateSDUpscale.upscale(
-            self, redrawn, model, positive, negative, vae, 1.0, seed,
-            steps, cfg, sampler_name, scheduler, denoise, None,
-            "None", tile_width, tile_height, mask_blur, tile_padding,
-            seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-            seam_fix_width, seam_fix_padding, True, tiled_decode, 1,
-            tile_reference_latent=tile_reference_latent, reference_strength=reference_strength,
-            reference_image=reference_image, mask=mask, use_mask=use_mask,
-        )
+        # Last, so that whatever the pipeline did to the colours is corrected on the image that
+        # actually leaves the node, the seam fix included
+        redrawn = apply_color_match(redrawn, image, color_match, mask, use_mask)
+        return (redrawn,)
 
 
 def USDU_guider_inputs():

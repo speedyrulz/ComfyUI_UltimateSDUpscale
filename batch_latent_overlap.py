@@ -372,7 +372,6 @@ def redraw(
     reference_image: Optional[torch.Tensor] = None,
     mask: Optional[torch.Tensor] = None,
     use_mask: bool = False,
-    color_match: float = 0.0,
     tile_prompts: Optional[List] = None,
 ) -> torch.Tensor:
     """
@@ -466,9 +465,6 @@ def redraw(
         (decoded,) = VAEDecodeTiled().decode(vae, samples, 512)
 
     decoded = decoded.to(device=canvas_pixels.device, dtype=canvas_pixels.dtype)
-    if color_match > 0.0:
-        decoded = match_colors(decoded, canvas_pixels, color_match, canvas_mask)
-
     return composite(image, decoded, (x_offset, y_offset), canvas_mask)
 
 
@@ -500,7 +496,18 @@ def changed_region_pixels(refined: torch.Tensor, source: torch.Tensor,
     so says nothing about how the model's colours drifted, and the whole canvas otherwise. Large
     images are sampled rather than measured in full, which changes the statistics by nothing that
     matters and keeps this off the critical path.
+
+    The measurement is taken on locally averaged pixels: a colour drift survives averaging a
+    neighbourhood, while a change in fine texture (the VAE smoothing grain, the model sharpening)
+    does not, so this keeps texture differences from being mistaken for saturation differences.
     """
+    kernel = min(4, refined.shape[1], refined.shape[2])
+    if kernel > 1:
+        refined = F.avg_pool2d(refined.movedim(-1, 1), kernel).movedim(1, -1)
+        source = F.avg_pool2d(source.movedim(-1, 1), kernel).movedim(1, -1)
+        if mask is not None:
+            mask = F.avg_pool2d(mask.unsqueeze(1).float(), kernel).squeeze(1)
+
     flat_refined = refined.reshape(-1, refined.shape[-1])
     flat_source = source.reshape(-1, source.shape[-1])
 
@@ -579,6 +586,11 @@ def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float,
     gain = torch.where(measurable, source_spread / refined_spread.clamp(min=1e-3),
                        torch.ones_like(source_spread)).clamp(MIN_COLOR_GAIN, MAX_COLOR_GAIN)
 
+    if float((source_middle - refined_middle).abs().max()) < 0.008 and float((gain - 1.0).abs().max()) < 0.05:
+        # No real drift to correct: applying the measurement noise would only add a small error
+        logger.debug("Skipping the colour match, the colours already agree")
+        return refined
+
     shape = (1, 1, 1, refined.shape[-1])
     matched = (refined - refined_middle.reshape(shape)) * gain.reshape(shape) + source_middle.reshape(shape)
 
@@ -588,6 +600,30 @@ def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float,
                 [round(v, 3) for v in (source_middle - refined_middle).tolist()],
                 [round(v, 3) for v in gain.tolist()])
     return torch.lerp(refined, (refined + move).clamp(0.0, 1.0), strength)
+
+
+def apply_color_match(result: torch.Tensor, original: torch.Tensor, strength: float,
+                      mask: Optional[torch.Tensor] = None, use_mask: bool = False) -> torch.Tensor:
+    """
+    Match the colours of a finished result to the image it came from.
+
+    This is the last thing the node does, after the seam fix, so whatever the pipeline did to the
+    colours along the way is corrected on the image that actually leaves the node. With a mask the
+    drift is measured inside it and pixels outside it are left exactly as they are.
+    """
+    if strength <= 0.0 or result.shape != original.shape:
+        return result
+
+    canvas_mask = None
+    if use_mask and mask is not None:
+        canvas_mask = _mask_for_canvas(mask, original.shape, (0, 0),
+                                       (original.shape[1], original.shape[2]))
+
+    matched = match_colors(result, original, strength, canvas_mask)
+    if canvas_mask is not None:
+        alpha = canvas_mask.to(device=matched.device, dtype=matched.dtype).unsqueeze(-1)
+        matched = result.float() * (1.0 - alpha) + matched * alpha
+    return matched.to(result.dtype)
 
 
 def composite(image: torch.Tensor, decoded: torch.Tensor, offset: Tuple[int, int],
