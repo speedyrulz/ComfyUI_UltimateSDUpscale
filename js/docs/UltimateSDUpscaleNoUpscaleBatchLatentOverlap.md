@@ -47,7 +47,7 @@ Because the tiles share one latent and one noise field, they never diverge in th
 | `positive_top_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the top right tile. |
 | `positive_bottom_left` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom left tile. |
 | `positive_bottom_right` | CONDITIONING | Conditioning Input | None | - | Optional prompt for the bottom right tile. |
-| `color_match` | FLOAT | Number Input | 0.00 | 0.0-1.0 (step 0.05) | Pull the colours of the result back towards the input image. Each channel is rescaled to the mean and standard deviation of the input, which corrects an overall tint or exposure shift without flattening the generated detail. The shift is measured only over the parts of the image the edit left alone, so recolouring something in the picture does not drag the rest of the image towards its old colour. 0.00 leaves the model's colours alone, 1.00 matches the input fully. |
+| `color_match` | FLOAT | Number Input | 0.00 | 0.0-1.0 (step 0.05) | Pull the colours of the redrawn area back towards the input image. Each channel is shifted and rescaled so that what was redrawn sits where the original did, correcting the tint and exposure drift edit models are prone to. The measurement is a median taken over the area that was actually redrawn, which is the masked area when a mask is used, so a deliberate recolour of part of that area barely moves it and the correction that comes out is the drift the rest of the area shares. 0.00 leaves the model's colours alone, 1.00 matches the input fully. |
 
 ## Outputs
 
@@ -74,10 +74,10 @@ Because the tiles share one latent and one noise field, they never diverge in th
 	- The VAE can only encode whole blocks, so if the image size is not a multiple of the VAE compression factor the outermost few pixels are left exactly as they came in. Feed it an image whose size is a multiple of 8 (or 16 for Flux.2) to refine every pixel.
 
 5. **Colour shifts**
-	- Edit models drift: the whole image comes back slightly warmer, cooler or flatter than it went in. In a tiled edit that shows up against the rest of the picture, and against anything the mask left untouched.
-	- `color_match` corrects that drift. It measures it only where the model reproduced what it was given, so an edit that deliberately changes a colour keeps its new colour, while skin, background and everything the edit did not touch keep the tones of the original.
-	- Start around 0.50 to 0.80. Use 1.00 when the result should be indistinguishable in colour from the input, which is the usual choice when the edit is a local one.
-	- If the edit changes nearly the entire image there is nothing dependable left to measure, and the correction is skipped with a warning rather than applied from unreliable statistics.
+	- Edit models drift: what comes back is tinted, warmer or flatter than what went in. With a mask this is at its most obvious, because the redrawn area sits directly against untouched pixels that did not drift with it.
+	- `color_match` corrects that drift, and for a masked edit it is measured inside the mask, which is the only place the drift exists. Turn it up to 1.00 for a masked edit where the result should be indistinguishable in colour from its surroundings; 0.50 to 0.80 leaves the edit some colour of its own.
+	- It uses a median rather than an average, so an edit that deliberately recolours part of the area keeps its new colour: a recoloured object is a minority of the pixels and barely moves the median, while the drift the rest of the area shares is what gets corrected.
+	- The correction is capped, so even an area that was rewritten from top to bottom, where there is no shared drift to find, cannot pull the picture far.
 
 6. **Per tile prompts**
 	- The four `positive_<corner>` inputs give each tile its own text prompt: the four tiles are sampled as one batch, so each tile attends to its own prompt row while still being averaged with its neighbours in the overlaps. Describe what actually sits in that quarter of the image and the shared overlap keeps the quarters consistent with each other.

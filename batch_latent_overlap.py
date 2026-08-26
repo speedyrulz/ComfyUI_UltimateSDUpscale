@@ -467,7 +467,7 @@ def redraw(
 
     decoded = decoded.to(device=canvas_pixels.device, dtype=canvas_pixels.dtype)
     if color_match > 0.0:
-        decoded = match_colors(decoded, canvas_pixels, color_match)
+        decoded = match_colors(decoded, canvas_pixels, color_match, canvas_mask)
 
     return composite(image, decoded, (x_offset, y_offset), canvas_mask)
 
@@ -491,34 +491,50 @@ def _mask_for_canvas(mask: torch.Tensor, image_shape, offset: Tuple[int, int],
     return mask[:, y_offset:y_offset + canvas_height, x_offset:x_offset + canvas_width]
 
 
-def unchanged_weight(refined: torch.Tensor, source: torch.Tensor, tolerance: float = 0.12) -> torch.Tensor:
+def changed_region_pixels(refined: torch.Tensor, source: torch.Tensor,
+                          mask: Optional[torch.Tensor], limit: int = 200000):
     """
-    Per pixel weight for how much of the image the model left alone, as a (1, H, W) tensor.
+    The pixels of the part of the image the redraw actually rewrote, as two (N, C) tensors.
 
-    Pixels that came back close to what went in are what a colour shift can be measured against.
-    Pixels the edit actually changed - recoloured clothing, replaced objects - are meant to be
-    different and must not be measured, or the correction would drag the whole image back towards
-    the colours of the thing that was deliberately changed.
-
-    The difference is smoothed first so that ordinary detail and noise do not read as a change.
+    That is the masked area when there is a mask, since everything outside it is kept as it was and
+    so says nothing about how the model's colours drifted, and the whole canvas otherwise. Large
+    images are sampled rather than measured in full, which changes the statistics by nothing that
+    matters and keeps this off the critical path.
     """
-    difference = (refined - source).abs().mean(dim=-1, keepdim=True).movedim(-1, 1)
-    difference = F.avg_pool2d(difference, kernel_size=9, stride=1, padding=4)
-    weight = (1.0 - difference / max(tolerance, 1e-3)).clamp(0.0, 1.0)
-    return weight[:, 0]
+    flat_refined = refined.reshape(-1, refined.shape[-1])
+    flat_source = source.reshape(-1, source.shape[-1])
+
+    if mask is not None:
+        selected = (mask.reshape(-1) > 0.5).nonzero(as_tuple=True)[0]
+        if selected.numel() >= 64:
+            flat_refined = flat_refined[selected]
+            flat_source = flat_source[selected]
+
+    count = flat_refined.shape[0]
+    if count > limit:
+        step = count // limit + 1
+        flat_refined = flat_refined[::step]
+        flat_source = flat_source[::step]
+
+    return flat_refined, flat_source
 
 
-def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float) -> torch.Tensor:
+def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float,
+                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Pull the colours of the refined canvas back towards the image it came from.
+    Pull the colours of the redrawn area back towards the image it came from.
 
-    Edit models tend to shift the whole image slightly in tint and contrast, which shows up against
-    whatever was not refined and, in a tiled edit, against the rest of the picture. Each channel is
-    rescaled so that its mean and standard deviation match the source again, which corrects an
-    overall shift without flattening the detail that was just generated.
+    Edit models drift: what comes back is tinted or lifted compared to what went in, which shows up
+    against the parts of the picture that were not redrawn. Each channel is shifted and rescaled so
+    that the redrawn area sits where the original did.
 
-    The statistics are measured only over the parts of the image the edit left alone, so changing
-    the colour of something in the picture does not pull everything else towards its old colour.
+    The measurement is a median, not a mean, and it is taken over the area that was actually
+    redrawn. Using the median is what lets this coexist with an edit that deliberately changes
+    something: recoloured clothing is a minority of the pixels, so it barely moves the median, and
+    the correction that comes out is the drift the rest of the area shares rather than the colour of
+    the thing that was changed. The correction is also capped, so an area that really was rewritten
+    from top to bottom cannot pull the picture far.
+
     *strength* blends between the model's own colours (0.0) and a full match (1.0).
     """
     if strength <= 0.0:
@@ -527,31 +543,28 @@ def match_colors(refined: torch.Tensor, source: torch.Tensor, strength: float) -
     refined = refined.float()
     source = source.float()
 
-    weight = unchanged_weight(refined, source).reshape(1, -1, 1)
-    total = weight.sum()
-    pixels = weight.shape[1]
-    if float(total) < 0.02 * pixels:
-        # Almost the whole image was changed, so there is nothing dependable left to measure
-        logger.warning("Skipping the colour match, the edit changed nearly the whole image")
+    sampled_refined, sampled_source = changed_region_pixels(refined, source, mask)
+    if sampled_refined.shape[0] < 64:
+        logger.warning("Skipping the colour match, there is too little of the image to measure")
         return refined
 
-    flat_refined = refined.reshape(1, -1, refined.shape[-1])
-    flat_source = source.reshape(1, -1, source.shape[-1])
+    refined_middle = sampled_refined.median(dim=0).values
+    source_middle = sampled_source.median(dim=0).values
+    refined_spread = (sampled_refined - refined_middle).abs().median(dim=0).values
+    source_spread = (sampled_source - source_middle).abs().median(dim=0).values
 
-    refined_mean = (flat_refined * weight).sum(dim=1, keepdim=True) / total
-    source_mean = (flat_source * weight).sum(dim=1, keepdim=True) / total
-    refined_std = ((((flat_refined - refined_mean) ** 2) * weight).sum(dim=1, keepdim=True) / total).sqrt()
-    source_std = ((((flat_source - source_mean) ** 2) * weight).sum(dim=1, keepdim=True) / total).sqrt()
+    # A cap on both halves of the correction: a drift is a nudge, and anything bigger than this is
+    # the measurement being wrong rather than the model being that far off
+    offset = (source_middle - refined_middle).clamp(-0.15, 0.15)
+    measurable = (refined_spread > 1e-3) & (source_spread > 1e-3)
+    scale = torch.where(measurable, source_spread / refined_spread.clamp(min=1e-3),
+                        torch.ones_like(source_spread)).clamp(0.75, 1.333)
 
     shape = (1, 1, 1, refined.shape[-1])
-    # Only rescale the spread where there is a spread to measure, and never by much: a flat region
-    # would otherwise give a ratio near zero or a huge one and wash the whole image out. A shift of
-    # the mean is what corrects a tint, the scale only corrects contrast.
-    measurable = (refined_std > 1e-3) & (source_std > 1e-3)
-    scale = torch.where(measurable, source_std / refined_std.clamp(min=1e-3), torch.ones_like(source_std))
-    scale = scale.clamp(0.5, 2.0).reshape(shape)
-    matched = (refined - refined_mean.reshape(shape)) * scale + source_mean.reshape(shape)
-    logger.debug("Colour match measured over %.0f%% of the canvas", 100.0 * float(total) / pixels)
+    matched = (refined - refined_middle.reshape(shape)) * scale.reshape(shape)         + (refined_middle + offset).reshape(shape)
+
+    logger.debug("Colour match over %d pixels: offset %s, scale %s",
+                 sampled_refined.shape[0], offset.tolist(), scale.tolist())
     return torch.lerp(refined, matched.clamp(0.0, 1.0), strength)
 
 
