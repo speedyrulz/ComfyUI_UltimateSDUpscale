@@ -10,7 +10,8 @@ import itertools
 import logging
 import math
 import threading
-from collections import OrderedDict
+import types
+from collections import OrderedDict, namedtuple
 from contextlib import nullcontext
 
 import torch
@@ -91,6 +92,9 @@ def _crop_hw(t, y0, y1, x0, x1):
 def _crop_pad_hw(t, y0, y1, x0, x1):
     # crop, then pad to the DiT patch size like _forward does for the video (patchify_video does not pad)
     return comfy.ldm.common_dit.pad_to_patch_size(_crop_hw(t, y0, y1, x0, x1), (1, PATCH, PATCH))
+
+
+TileSpec = namedtuple("TileSpec", "index iy ix y0 x0 y1 x1 ye xe")  # y1/x1: tile end, ye/xe: end clipped to the frame
 
 
 class _LRU(OrderedDict):
@@ -257,6 +261,34 @@ class H3TiledForward:
         return layout
 
     # -- the wrapper ------------------------------------------------------------------------------------------
+    def tile_inputs(self, payload, text_len, t, th, tw, y0, x0, ye, xe, hp, wp, audio_t):
+        """Payload of one tile (guides cropped to the window) with the tile's layout installed.
+
+        Shared by the local loop and by the remote worker, so both build identical tile inputs.
+        """
+        tile_payload = crop_payload(payload, y0, ye, x0, xe)
+        tile_payload["layout"] = self._tile_layout(payload, tile_payload, text_len, t, th, tw, y0, x0, hp, wp, audio_t)
+        return tile_payload
+
+    def _local_tile(self, call, tile):
+        """Run the model on one tile in this process and return its raw output."""
+        tile_kwargs = dict(call.kwargs)
+        tile_kwargs["minimax_payload"] = self.tile_inputs(call.payload, call.text_len, call.t, call.th, call.tw,
+                                                          tile.y0, tile.x0, tile.ye, tile.xe, call.hp, call.wp, call.audio_t)
+        if call.denoise_mask is not None:
+            tile_kwargs["denoise_mask"] = _crop_hw(call.denoise_mask, tile.y0, tile.ye, tile.x0, tile.xe)
+        tile_video = call.video[..., tile.y0:tile.ye, tile.x0:tile.xe]
+        x = call.x
+        tile_x = [tile_video] + list(x[1:]) if call.is_list else tile_video
+        scope = model_prefetch.malloc_graph_scope(call.video.device) if call.scoped else nullcontext()
+        with scope:
+            return call.executor(tile_x, call.timestep, call.context, call.transformer_options, **tile_kwargs)
+
+    def _tile_outputs(self, call, tiles):
+        """Yield (tile, model output) for every tile, in tile order. Subclasses may compute them elsewhere."""
+        for tile in tiles:
+            yield tile, self._local_tile(call, tile)
+
     def __call__(self, executor, x, timestep, context, transformer_options={}, **kwargs):
         is_list = isinstance(x, (list, tuple))
         video = x[0] if is_list else x
@@ -291,25 +323,21 @@ class H3TiledForward:
         if scoped:
             model_prefetch.malloc_graph_end()
 
+        tiles = []
         for (iy, y0), (ix, x0) in itertools.product(enumerate(ys), enumerate(xs)):
-            y1, x1 = y0 + th, x0 + tw
-            ye, xe = min(y1, height), min(x1, width)
-            tile_kwargs = dict(kwargs)
-            tile_payload = crop_payload(payload, y0, ye, x0, xe)
-            tile_payload["layout"] = self._tile_layout(payload, tile_payload, text_len, t, th, tw, y0, x0,
-                                                       hp, wp, audio_t)
-            tile_kwargs["minimax_payload"] = tile_payload
-            if denoise_mask is not None:
-                tile_kwargs["denoise_mask"] = _crop_hw(denoise_mask, y0, ye, x0, xe)
-            tile_video = video[..., y0:ye, x0:xe]
-            tile_x = [tile_video] + list(x[1:]) if is_list else tile_video
-            scope = model_prefetch.malloc_graph_scope(video.device) if scoped else nullcontext()
-            with scope:
-                out = executor(tile_x, timestep, context, transformer_options, **tile_kwargs)
+            tiles.append(TileSpec(len(tiles), iy, ix, y0, x0, y0 + th, x0 + tw, min(y0 + th, height), min(x0 + tw, width)))
+        call = types.SimpleNamespace(
+            executor=executor, x=x, is_list=is_list, video=video, timestep=timestep, context=context,
+            transformer_options=transformer_options, kwargs=kwargs, payload=payload, t=t, text_len=text_len,
+            audio_t=audio_t, hp=hp, wp=wp, height=height, width=width, th=th, tw=tw, denoise_mask=denoise_mask,
+            scoped=scoped)
+
+        for tile, out in self._tile_outputs(call, tiles):
             out_video = out[0] if is_list else out
-            w = (axis_weights(ys, th, iy)[:ye - y0, None] * axis_weights(xs, tw, ix)[None, :xe - x0]).to(video.device)
-            acc[..., y0:ye, x0:xe] += out_video.to(torch.float32) * w
-            wsum[..., y0:ye, x0:xe] += w
+            w = (axis_weights(ys, th, tile.iy)[:tile.ye - tile.y0, None]
+                 * axis_weights(xs, tw, tile.ix)[None, :tile.xe - tile.x0]).to(video.device)
+            acc[..., tile.y0:tile.ye, tile.x0:tile.xe] += out_video.to(torch.float32) * w
+            wsum[..., tile.y0:tile.ye, tile.x0:tile.xe] += w
             if is_list and len(out) > 1:
                 if extra_acc is None:
                     extra_acc = [o.to(torch.float32).clone() for o in out[1:]]
