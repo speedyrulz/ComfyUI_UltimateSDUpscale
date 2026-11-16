@@ -340,3 +340,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UltimateSDUpscaleCustomSample": "Ultimate SD Upscale (Custom Sample)",
     "UltimateSDUpscaleGuider": "Ultimate SD Upscale (Guider)",
 }
+
+# MiniMax H3 latent tile blending nodes
+from usdu_h3_tiled import NODE_CLASS_MAPPINGS as H3_NODE_CLASS_MAPPINGS
+from usdu_h3_tiled import NODE_DISPLAY_NAME_MAPPINGS as H3_NODE_DISPLAY_NAME_MAPPINGS
+NODE_CLASS_MAPPINGS.update(H3_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(H3_NODE_DISPLAY_NAME_MAPPINGS)
