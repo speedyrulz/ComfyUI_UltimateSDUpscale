@@ -291,6 +291,24 @@ class E_RealModel(unittest.TestCase):
         self.assertFalse(bool(torch.isnan(out).any()))
 
 
+class I_GuideSize(unittest.TestCase):
+    def test_guide_at_another_size_is_a_clear_error(self):
+        # first-pass guide (16x16 latent) reused on an upscaled 32x32 latent, as in a real workflow
+        payload = make_payload(16, 16)
+        x = [torch.randn(1, 24, 3, 32, 32), torch.randn(1, 32, 2, 6)]
+        w = Wrapper(256, 256, 64)
+        for wrapper in (w, Wrapper(4096, 4096, 64)):  # tiled and single-tile paths
+            with self.assertRaisesRegex(RuntimeError, "upscaled size"):
+                wrapper(pointwise_executor, x, torch.tensor([500.0]), torch.randn(1, 5, 8), {},
+                        minimax_payload=payload)
+
+    def test_matching_and_odd_guides_pass(self):
+        pack.check_guide_sizes(make_payload(15, 21), 15, 21)
+        pack.check_guide_sizes(make_payload(16, 22), 15, 21)  # even-padded guide
+        pack.check_guide_sizes({}, 15, 21)
+        pack.check_guide_sizes(None, 15, 21)
+
+
 class G_Guards(unittest.TestCase):
     class FunControlPatch:
         def diffusion_model_wrapper(self, executor, x, *a, **k):
