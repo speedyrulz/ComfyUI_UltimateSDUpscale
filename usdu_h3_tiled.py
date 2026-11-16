@@ -166,6 +166,23 @@ def tile_layout(full_layout, text_len, latent_t, tile_h, tile_w, audio_t, y0, x0
     return layout
 
 
+def check_guide_sizes(payload, height, width):
+    """Keyframe guides must be encoded at the latent's own size; H3 cannot use a guide of another size."""
+    for kf in (payload or {}).get("keyframes") or ():
+        z = kf.get("latent")
+        if z is None:
+            continue
+        gh, gw = int(z.shape[-2]), int(z.shape[-1])
+        if (_even(gh), _even(gw)) != (_even(height), _even(width)):
+            raise RuntimeError(
+                "H3 tiled sampling: a keyframe guide (first/last frame or Add Guide) was encoded at %dx%d px, but the "
+                "latent being sampled is %dx%d px. This happens when the conditioning from the first pass is reused "
+                "after the latent was upscaled. Build the guide again at the upscaled size (for example a second "
+                "MiniMax H3 Image to Video with the upscaled width/height feeding this sampler), or use conditioning "
+                "without keyframe guides for the refine pass."
+                % (gw * LATENT_PX, gh * LATENT_PX, width * LATENT_PX, height * LATENT_PX))
+
+
 class H3TiledForward:
     """DIFFUSION_MODEL wrapper that runs the H3 model per spatial tile and blends the video outputs."""
 
@@ -246,6 +263,7 @@ class H3TiledForward:
         if video.ndim != 5:
             return executor(x, timestep, context, transformer_options, **kwargs)
         height, width = int(video.shape[-2]), int(video.shape[-1])
+        check_guide_sizes(kwargs.get("minimax_payload"), height, width)
         th, ys, tw, xs = self.grid(height, width)
         if len(ys) == 1 and len(xs) == 1:
             return executor(x, timestep, context, transformer_options, **kwargs)
