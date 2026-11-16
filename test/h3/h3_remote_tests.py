@@ -81,6 +81,7 @@ class InProcWorker:
         self.delay, self.fail_on = delay, fail_on
         self.ready, self.dead, self.reason = True, False, None
         self.tiles = []
+        self.timeouts = []
         self.plan = None
         self.closed = None
 
@@ -91,6 +92,7 @@ class InProcWorker:
         self.dead, self.reason = True, reason
 
     def post_tile(self, key, setup_blob, body, timeout):
+        self.timeouts.append(timeout)
         if self.dead:
             raise remote.RemoteError("dead")
         if self.fail_on is not None and len(self.tiles) >= self.fail_on:
@@ -370,6 +372,40 @@ class C_Scheduler(unittest.TestCase):
             self.assertEqual(sorted(w.tiles), run.last_assignment)  # identical assignment every call
             w.tiles.clear()
         self.assertEqual(w.plan[0], 1)
+
+    def test_worker_joining_late_gets_the_warm_up_timeout(self):
+        # regression (first real run): the worker became ready after main had timed local tiles, so its first tile,
+        # which loads the model onto its GPU, got the short steady-state timeout and the worker was dropped
+        w = self.worker(delay=0.01)
+        w.ready = False
+        run = make_run(w)
+        run.begin()
+        self.assertSame(self.call(run))  # not ready: all local, local tile times recorded
+        self.assertTrue(run.local_times)
+        self.assertEqual(w.timeouts, [])
+        w.ready = True
+        self.assertSame(self.call(run))  # the worker's first tile: warm-up timeout, and no calibration from it
+        self.assertEqual(w.timeouts[0], remote.FIRST_TILE_TIMEOUT_S)
+        self.assertTrue(run.worker_warm)
+        if len(w.tiles) == 1:
+            self.assertIsNone(run.ratio)  # only the warm-up tile came back: calibrate on the next call
+            self.assertSame(self.call(run))
+        self.assertIsNotNone(run.ratio)
+        self.assertEqual(w.timeouts.count(remote.FIRST_TILE_TIMEOUT_S), 1)
+        self.assertEqual(len(run.remote_times), len(w.tiles) - 1)  # the warm-up tile is never timed
+        n = len(w.timeouts)
+        self.assertSame(self.call(run))
+        self.assertTrue(all(t == remote.MIN_TILE_TIMEOUT_S for t in w.timeouts[n:]))  # tiny tiles: the floor
+
+    def test_tile_timeout_uses_the_slower_side(self):
+        run = make_run(self.worker())
+        self.assertEqual(run.tile_timeout(), remote.FIRST_TILE_TIMEOUT_S)
+        run.local_times.extend([2.0, 2.0, 2.0])
+        self.assertEqual(run.tile_timeout(), remote.MIN_TILE_TIMEOUT_S)
+        run.local_times.extend([10.0] * 5)
+        self.assertEqual(run.tile_timeout(), 50.0)
+        run.remote_times.extend([20.0] * 3)  # a slower worker raises the timeout
+        self.assertEqual(run.tile_timeout(), 100.0)
 
     def test_same_ratio_same_assignment_across_runs(self):
         seen = []

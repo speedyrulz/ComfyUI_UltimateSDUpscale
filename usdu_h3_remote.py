@@ -69,7 +69,7 @@ MAX_HEADER_BYTES = 1 << 20
 MAX_TILE_ELEMENTS = 1 << 28
 MIN_TILE_TIMEOUT_S = 30.0
 TILE_TIMEOUT_FACTOR = 5.0
-FIRST_TILE_TIMEOUT_S = 300.0  # before any local tile time is known (worker warm-up included)
+FIRST_TILE_TIMEOUT_S = 600.0  # until the worker has delivered a tile: its first one loads the model onto its GPU
 MAX_TREE_DEPTH = 32
 MAX_TREE_NODES = 100000
 MAX_SETUPS = 4  # worker keeps this many per-session setups (context + payload)
@@ -1259,6 +1259,8 @@ class RemoteRun:
     def _reset(self):
         self.ratio = None
         self.local_times = collections.deque(maxlen=64)
+        self.remote_times = collections.deque(maxlen=64)  # worker tiles after its warm-up tile
+        self.worker_warm = False
         self.base_options = {}
         self.hooks_present = False
         self._warned = set()
@@ -1365,6 +1367,13 @@ class RemoteRun:
     def _to_device(out, device):
         return [o.to(device) for o in out] if isinstance(out, list) else out.to(device)
 
+    def tile_timeout(self):
+        """Timeout for a worker tile once the worker is warm: a multiple of the slower side's median tile time."""
+        medians = [statistics.median(t) for t in (self.local_times, self.remote_times) if t]
+        if not medians:
+            return FIRST_TILE_TIMEOUT_S
+        return max(MIN_TILE_TIMEOUT_S, TILE_TIMEOUT_FACTOR * max(medians))
+
     def tile_outputs(self, owner, call, tiles, local_fn):
         """Yield (tile, output) for every tile in tile order, some computed on the worker (R5, R6)."""
         session = self.session
@@ -1418,12 +1427,17 @@ class RemoteRun:
                     current = remote_q.pop()
                     if current is None:
                         break
-                    median = statistics.median(self.local_times) if self.local_times else None
-                    timeout = FIRST_TILE_TIMEOUT_S if median is None else max(MIN_TILE_TIMEOUT_S, TILE_TIMEOUT_FACTOR * median)
+                    warm = self.worker_warm
+                    timeout = self.tile_timeout() if warm else FIRST_TILE_TIMEOUT_S
                     t0 = time.perf_counter()
                     data = session.post_tile(setup_key, setup_blob, blobs[current], timeout)
                     results[current] = self._parse_result(data, call, tiles[current])
-                    batch_remote.append(time.perf_counter() - t0)
+                    if warm:
+                        dt = time.perf_counter() - t0
+                        batch_remote.append(dt)
+                        self.remote_times.append(dt)
+                    else:  # the warm-up tile (model load on the worker) says nothing about its speed
+                        self.worker_warm = True
                     current = None
             except Exception as e:
                 session.fail("%s: %s" % (type(e).__name__, e))
